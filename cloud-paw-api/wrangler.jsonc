@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloud-paw-vip-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-21",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloud-paw-vip-db",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

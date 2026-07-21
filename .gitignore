@@ -1,0 +1,3 @@
+cloud-paw-api/.wrangler/
+cloud-paw-api/cloudflare-login.log
+cloud-paw-api/worker-tail.log
