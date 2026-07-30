@@ -2,7 +2,20 @@ const API_URL = window.CLOUD_PAW_API_URL;
 let cloudPawSession = localStorage.getItem('cloud-paw-session') || '';
 let cloudPawUser = null;
 async function apiRequest(path, options = {}) {
-  const response = await fetch(`${API_URL}${path}`, { ...options, headers: { 'content-type': 'application/json', ...(cloudPawSession ? { authorization: `Bearer ${cloudPawSession}` } : {}), ...(options.headers || {}) } });
+  if (!API_URL) throw new Error('会员服务正在更新，请重新打开最新网址后再试。');
+  const requestOptions = { ...options, headers: { 'content-type': 'application/json', ...(cloudPawSession ? { authorization: `Bearer ${cloudPawSession}` } : {}), ...(options.headers || {}) } };
+  let response;
+  try {
+    response = await fetch(`${API_URL}${path}`, requestOptions);
+  } catch (_) {
+    // 网络短暂波动时自动再试一次，避免用户误以为兑换码失效。
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    try {
+      response = await fetch(`${API_URL}${path}`, requestOptions);
+    } catch (_) {
+      throw new Error('会员服务暂时连不上。请检查网络后重新打开最新版网址再试；这不会消耗你的兑换码。');
+    }
+  }
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || '服务暂时无法连接，请稍后再试。');
   return body;
