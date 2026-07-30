@@ -8,7 +8,12 @@ $runtime = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runti
 $env:HTTP_PROXY = 'http://127.0.0.1:9910'
 $env:HTTPS_PROXY = 'http://127.0.0.1:9910'
 $env:Path = (Join-Path $runtime 'node\bin') + ';' + $env:Path
-$pnpm = Join-Path $runtime 'bin\fallback\pnpm.cmd'
+$node = Join-Path $runtime 'node\bin\node.exe'
+$store = Join-Path $env:LOCALAPPDATA 'pnpm\store\v11\links'
+$wrangler = Get-ChildItem -LiteralPath $store -Recurse -Filter 'wrangler.js' -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -match 'node_modules\\wrangler\\bin\\wrangler\.js$' } |
+  Select-Object -First 1 -ExpandProperty FullName
+if (-not $wrangler) { throw 'Cloudflare Wrangler was not found.' }
 
 function Get-Hash([string]$Text) {
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
@@ -33,7 +38,7 @@ for ($i = 0; $i -lt $Count; $i++) {
   $hash = Get-Hash $code
   $id = [guid]::NewGuid().ToString()
   $sql = "INSERT INTO redeem_codes (id, code_hash, duration_days) VALUES ('$id', '$hash', $Days);"
-  & $pnpm dlx --reporter=append-only wrangler@latest d1 execute cloud-paw-vip-db --remote --command $sql | Out-Null
+  & $node $wrangler d1 execute cloud-paw-vip-db --remote --command $sql | Out-Null
   $issued += $code
 }
 
