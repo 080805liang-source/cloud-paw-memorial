@@ -58,7 +58,7 @@ exports.main = async (event) => {
       if (await getOne('cp_users', { email })) return reply(event, { error: '这个邮箱已经注册，请直接登录。' }, 409);
       const salt = random();
       const added = await db.collection('cp_users').add({ email, passwordHash: passwordHash(password, salt), passwordSalt: salt, vipExpiresAt: null, createdAt: now() });
-      const user = { _id: added.id, email, vipExpiresAt: null };
+      const user = { _id: added.id || added._id, email, vipExpiresAt: null };
       return reply(event, { token: await createSession(user._id), user: publicUser(user) }, 201);
     }
     if (method === 'POST' && path === '/auth/login') {
