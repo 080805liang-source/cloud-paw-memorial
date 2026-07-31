@@ -8,9 +8,10 @@ const now = () => new Date().toISOString();
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 const passwordHash = (password, salt) => crypto.pbkdf2Sync(String(password), salt, 100000, 32, 'sha256').toString('hex');
+const isAllowedOrigin = (origin) => origin === WEB_ORIGIN || /^https:\/\/cloud-paw-vip-cn-d0eub7r110788a3(?:-[a-z0-9]+)?(?:\.ap-shanghai)?\.(?:app\.tcloudbase\.com|tcloudbaseapp\.com)$/i.test(origin);
 const headers = (origin) => ({
   'content-type': 'application/json; charset=utf-8',
-  'access-control-allow-origin': origin === WEB_ORIGIN ? origin : WEB_ORIGIN,
+  'access-control-allow-origin': isAllowedOrigin(origin) ? origin : WEB_ORIGIN,
   'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
   'access-control-allow-headers': 'content-type, authorization'
 });
@@ -46,7 +47,7 @@ exports.main = async (event) => {
   const path = String(event.path || '/').replace(/^\/api/, '') || '/';
   if (method === 'OPTIONS') return { statusCode: 204, headers: headers(event.headers?.origin || ''), body: '' };
   const origin = event.headers?.origin || '';
-  if (origin && origin !== WEB_ORIGIN) return reply(event, { error: '来源不被允许。' }, 403);
+  if (origin && !isAllowedOrigin(origin)) return reply(event, { error: '来源不被允许。' }, 403);
   try {
     if (path === '/health') return reply(event, { ok: true, region: 'cn' });
     const body = readBody(event);
