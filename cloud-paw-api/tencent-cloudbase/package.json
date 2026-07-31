@@ -1,0 +1,8 @@
+{
+  "name": "cloud-paw-vip-api-cn",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@cloudbase/node-sdk": "^3.17.0"
+  }
+}
