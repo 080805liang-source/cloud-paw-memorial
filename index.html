@@ -102,7 +102,7 @@
     <section id="member-auth" class="member-panel">
       <p class="eyebrow"><span></span> CLOUD PAW MEMBERSHIP</p><h2>把回忆，安放在<br /><em>只属于你的星光里。</em></h2>
       <div class="auth-switch"><button class="active" data-mode="login" type="button">登录</button><button data-mode="signup" type="button">注册</button></div>
-      <form id="auth-form"><label>邮箱<input id="auth-email" type="email" placeholder="name@example.com" required /></label><label>密码<input id="auth-password" type="password" minlength="8" placeholder="至少 8 位" required /></label><button class="button button-primary" type="submit">继续 <span>→</span></button></form><p id="auth-note" class="member-note"></p>
+      <form id="auth-form"><label>邮箱<input id="auth-email" type="email" placeholder="name@example.com" required /></label><label>密码<input id="auth-password" type="password" minlength="8" placeholder="至少 8 位" required /></label><label id="auth-confirm-wrap" hidden>确认密码<input id="auth-confirm-password" type="password" minlength="8" placeholder="请再次输入密码" /></label><button class="button button-primary" type="submit">继续 <span>→</span></button></form><p id="auth-note" class="member-note"></p>
     </section>
     <section id="member-vip" class="member-panel" hidden><p class="eyebrow"><span></span> VIP ACCESS</p><h2 id="member-title">开通云爪 VIP</h2><p id="member-status" class="member-intro">输入你购买后获得的兑换码，即可开通一个月 VIP。</p><form id="redeem-form"><label>月卡兑换码<input id="redeem-code" autocomplete="off" placeholder="例如：PAW-XXXX-XXXX" required /></label><button class="button button-primary" type="submit">兑换一个月 VIP <span>✦</span></button></form><button id="signout-button" class="plain-button" type="button">退出当前账号</button><p id="redeem-note" class="member-note"></p></section>
   </dialog>

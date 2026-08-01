@@ -85,6 +85,21 @@ ritualDialog.addEventListener('pointerup', (event) => {
 document.querySelector('.close-member').addEventListener('click', () => memberDialog.close());
 memberDialog.addEventListener('click', (event) => { if (event.target === memberDialog && !document.body.classList.contains('site-locked')) memberDialog.close(); });
 document.querySelectorAll('[data-mode]').forEach((button) => button.addEventListener('click', () => { mode = button.dataset.mode; document.querySelectorAll('[data-mode]').forEach((item) => item.classList.toggle('active', item === button)); document.querySelector('#auth-form .button').innerHTML = `${mode === 'login' ? '登录' : '注册'} <span>→</span>`; }));
+const confirmPasswordWrap = document.querySelector('#auth-confirm-wrap');
+const confirmPasswordInput = document.querySelector('#auth-confirm-password');
+document.querySelectorAll('[data-mode]').forEach((button) => button.addEventListener('click', () => {
+  const isSignup = button.dataset.mode === 'signup';
+  confirmPasswordWrap.hidden = !isSignup;
+  confirmPasswordInput.required = isSignup;
+  if (!isSignup) confirmPasswordInput.value = '';
+}));
+document.querySelector('#auth-form').addEventListener('submit', (event) => {
+  if (mode !== 'signup') return;
+  if (document.querySelector('#auth-password').value === confirmPasswordInput.value) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  document.querySelector('#auth-note').textContent = '两次输入的密码不一致，请重新确认。';
+}, true);
 document.querySelector('#auth-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const email = document.querySelector('#auth-email').value.trim(); const password = document.querySelector('#auth-password').value; const note = document.querySelector('#auth-note'); note.textContent = '正在处理…';
   const response = mode === 'login' ? await client.auth.signInWithPassword({ email, password }) : await client.auth.signUp({ email, password });
