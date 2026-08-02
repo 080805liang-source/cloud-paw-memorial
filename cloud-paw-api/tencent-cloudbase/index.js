@@ -3,7 +3,8 @@ const crypto = require('crypto');
 const app = tcb.init({ env: tcb.SYMBOL_CURRENT_ENV });
 const db = app.database();
 const WEB_ORIGIN = 'https://080805liang-source.github.io';
-const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '2533018119@qq.com').trim().toLowerCase();
+// 店主账号：无需兑换码，可进入管理员发卡区。
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '3903345807@qq.com').trim().toLowerCase();
 const now = () => new Date().toISOString();
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
