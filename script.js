@@ -24,18 +24,18 @@ const client = {
   auth: {
     getUser: async () => {
       if (!cloudPawSession) return { data: { user: null } };
-      try { const data = await apiRequest('/me'); cloudPawUser = { id: data.user.id, email: data.user.email, vip_expires_at: data.user.vipExpiresAt }; return { data: { user: cloudPawUser } }; }
+      try { const data = await apiRequest('/me'); cloudPawUser = { id: data.user.id, email: data.user.email, vip_expires_at: data.user.vipExpiresAt, is_admin: Boolean(data.user.isAdmin) }; return { data: { user: cloudPawUser } }; }
       catch (_) { localStorage.removeItem('cloud-paw-session'); cloudPawSession = ''; cloudPawUser = null; return { data: { user: null } }; }
     },
     signInWithPassword: async ({ email, password }) => {
-      try { const data = await apiRequest('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }); cloudPawSession = data.token; localStorage.setItem('cloud-paw-session', cloudPawSession); cloudPawUser = { id: data.user.id, email: data.user.email, vip_expires_at: data.user.vipExpiresAt }; return { data: { user: cloudPawUser }, error: null }; } catch (error) { return { data: null, error }; }
+      try { const data = await apiRequest('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }); cloudPawSession = data.token; localStorage.setItem('cloud-paw-session', cloudPawSession); cloudPawUser = { id: data.user.id, email: data.user.email, vip_expires_at: data.user.vipExpiresAt, is_admin: Boolean(data.user.isAdmin) }; return { data: { user: cloudPawUser }, error: null }; } catch (error) { return { data: null, error }; }
     },
     signUp: async ({ email, password }) => {
-      try { const data = await apiRequest('/auth/signup', { method: 'POST', body: JSON.stringify({ email, password }) }); cloudPawSession = data.token; localStorage.setItem('cloud-paw-session', cloudPawSession); cloudPawUser = { id: data.user.id, email: data.user.email, vip_expires_at: data.user.vipExpiresAt }; return { data: { user: cloudPawUser }, error: null }; } catch (error) { return { data: null, error }; }
+      try { const data = await apiRequest('/auth/signup', { method: 'POST', body: JSON.stringify({ email, password }) }); cloudPawSession = data.token; localStorage.setItem('cloud-paw-session', cloudPawSession); cloudPawUser = { id: data.user.id, email: data.user.email, vip_expires_at: data.user.vipExpiresAt, is_admin: Boolean(data.user.isAdmin) }; return { data: { user: cloudPawUser }, error: null }; } catch (error) { return { data: null, error }; }
     },
     signOut: async () => { try { await apiRequest('/auth/logout', { method: 'POST' }); } catch (_) {} cloudPawSession = ''; cloudPawUser = null; localStorage.removeItem('cloud-paw-session'); }
   },
-  from: () => ({ select: () => ({ eq: () => ({ maybeSingle: async () => ({ data: cloudPawUser ? { vip_expires_at: cloudPawUser.vip_expires_at } : null }) }) }) }),
+  from: () => ({ select: () => ({ eq: () => ({ maybeSingle: async () => ({ data: cloudPawUser ? { vip_expires_at: cloudPawUser.vip_expires_at, is_admin: cloudPawUser.is_admin } : null }) }) }) }),
   rpc: async (_name, { voucher_code }) => {
     try { const data = await apiRequest('/redeem', { method: 'POST', body: JSON.stringify({ code: voucher_code }) }); if (cloudPawUser) cloudPawUser.vip_expires_at = data.vipExpiresAt; return { data: data.vipExpiresAt, error: null }; } catch (error) { return { data: null, error }; }
   }
@@ -54,16 +54,16 @@ async function refreshMember() {
   authPanel.hidden = Boolean(user); vipPanel.hidden = !user;
   if (!user) { setGate(); return; }
   const { data } = await client.from('profiles').select('vip_expires_at').eq('id', user.id).maybeSingle();
-  const active = data?.vip_expires_at && new Date(data.vip_expires_at) > new Date();
+  const active = data?.is_admin || (data?.vip_expires_at && new Date(data.vip_expires_at) > new Date());
   setGate();
-  document.querySelector('#member-title').textContent = active ? '你的云爪 VIP 正在生效' : '开通云爪 VIP';
-  document.querySelector('#member-status').textContent = active ? `VIP 有效至 ${formatDate(data.vip_expires_at)}。现在可以开始为 TA 建立纪念馆。` : '输入你购买后获得的兑换码，即可开通一个月 VIP。';
+  document.querySelector('#member-title').textContent = data?.is_admin ? '管理员权限已开启' : active ? '你的云爪 VIP 正在生效' : '开通云爪 VIP';
+  document.querySelector('#member-status').textContent = data?.is_admin ? '你可以直接使用全部纪念馆功能，无需兑换卡密。' : active ? `VIP 有效至 ${formatDate(data.vip_expires_at)}。现在可以开始为 TA 建立纪念馆。` : '输入你购买后获得的兑换码，即可开通一个月 VIP。';
 }
 async function requireVip() {
   const { data: { user } } = await client.auth.getUser();
   if (!user) return openMember();
   const { data } = await client.from('profiles').select('vip_expires_at').eq('id', user.id).maybeSingle();
-  if (!data?.vip_expires_at || new Date(data.vip_expires_at) <= new Date()) return openMember();
+  if (!data?.is_admin && (!data?.vip_expires_at || new Date(data.vip_expires_at) <= new Date())) return openMember();
   ritualDialog.showModal();
 }
 document.querySelector('#member-button').addEventListener('click', openMember);
