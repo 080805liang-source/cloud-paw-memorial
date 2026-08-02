@@ -21,7 +21,8 @@ const getOne = async (collection, where) => {
   return result.data?.[0] || null;
 };
 const readBody = (event) => { try { return JSON.parse(event.body || '{}'); } catch (_) { return {}; } };
-const publicUser = (user) => ({ id: user._id, email: user.email, vipExpiresAt: user.vipExpiresAt || null });
+const isAdmin = (user) => String(user?.email || '').trim().toLowerCase() === ADMIN_EMAIL;
+const publicUser = (user) => ({ id: user._id, email: user.email, vipExpiresAt: user.vipExpiresAt || null, isAdmin: isAdmin(user) });
 const plusDays = (oldExpiry, days) => {
   const base = oldExpiry && new Date(oldExpiry) > new Date() ? new Date(oldExpiry) : new Date();
   base.setDate(base.getDate() + Number(days));
@@ -85,7 +86,7 @@ exports.main = async (event) => {
       return reply(event, { vipExpiresAt });
     }
     if (method === 'POST' && path === '/admin/issue-code') {
-      if (user.email !== ADMIN_EMAIL) return reply(event, { error: '只有管理员账号可以发卡。' }, 403);
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员账号可以发卡。' }, 403);
       const durationDays = Number(body.durationDays) === 90 ? 90 : 30;
       const code = `PAW-${crypto.randomBytes(8).toString('hex').toUpperCase().match(/.{1,4}/g).join('-')}`;
       await db.collection('cp_codes').add({
@@ -97,7 +98,7 @@ exports.main = async (event) => {
       return reply(event, { code, durationDays }, 201);
     }
     if (method === 'POST' && path === '/pet-license') {
-      if (!user.vipExpiresAt || new Date(user.vipExpiresAt) <= new Date()) {
+      if (!isAdmin(user) && (!user.vipExpiresAt || new Date(user.vipExpiresAt) <= new Date())) {
         return reply(event, { error: '请先兑换有效 VIP，再生成桌面宠物。' }, 403);
       }
       const fingerprint = String(body.fingerprint || '').toLowerCase();
@@ -128,7 +129,7 @@ exports.main = async (event) => {
         return reply(event, { active: false }, 403);
       }
       const owner = await getOne('cp_users', { _id: license.userId });
-      if (!owner?.vipExpiresAt || new Date(owner.vipExpiresAt) <= new Date()) return reply(event, { active: false }, 403);
+      if (!owner || (!isAdmin(owner) && (!owner.vipExpiresAt || new Date(owner.vipExpiresAt) <= new Date()))) return reply(event, { active: false }, 403);
       if (!license.deviceHash) await db.collection('cp_desktop_licenses').doc(license._id).update({ deviceHash, activatedAt: now() });
       return reply(event, { active: true, vipExpiresAt: owner.vipExpiresAt });
     }
