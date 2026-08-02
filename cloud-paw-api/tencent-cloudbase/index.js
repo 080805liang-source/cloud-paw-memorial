@@ -2,6 +2,7 @@ const tcb = require('@cloudbase/node-sdk');
 const crypto = require('crypto');
 const app = tcb.init({ env: tcb.SYMBOL_CURRENT_ENV });
 const db = app.database();
+const SHARED_MEMBERSHIP_API = 'https://cloud-paw-vip-api.cloud-paw-vip-080805liang.workers.dev';
 
 const WEB_ORIGIN = 'https://080805liang-source.github.io';
 const now = () => new Date().toISOString();
@@ -16,6 +17,22 @@ const headers = (origin) => ({
   'access-control-allow-headers': 'content-type, authorization'
 });
 const reply = (event, body, statusCode = 200) => ({ statusCode, headers: headers(event.headers?.origin || ''), body: JSON.stringify(body) });
+const proxyMembershipRequest = async (event, path) => {
+  const method = String(event.httpMethod || 'GET').toUpperCase();
+  const upstream = await fetch(`${SHARED_MEMBERSHIP_API}${path}`, {
+    method,
+    headers: {
+      'content-type': event.headers?.['content-type'] || 'application/json',
+      ...(event.headers?.authorization ? { authorization: event.headers.authorization } : {})
+    },
+    body: ['GET', 'HEAD'].includes(method) ? undefined : event.body || undefined
+  });
+  return {
+    statusCode: upstream.status,
+    headers: headers(event.headers?.origin || ''),
+    body: await upstream.text()
+  };
+};
 const getOne = async (collection, where) => {
   const result = await db.collection(collection).where(where).limit(1).get();
   return result.data?.[0] || null;
@@ -49,6 +66,8 @@ exports.main = async (event) => {
   const origin = event.headers?.origin || '';
   if (origin && !isAllowedOrigin(origin)) return reply(event, { error: '来源不被允许。' }, 403);
   try {
+    return await proxyMembershipRequest(event, path);
+    // The code below remains as the migration target for a future fully domestic data store.
     if (path === '/health') return reply(event, { ok: true, region: 'cn' });
     const body = readBody(event);
     if (method === 'POST' && path === '/auth/signup') {
