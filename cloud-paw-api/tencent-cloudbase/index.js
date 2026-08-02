@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const app = tcb.init({ env: tcb.SYMBOL_CURRENT_ENV });
 const db = app.database();
 const WEB_ORIGIN = 'https://080805liang-source.github.io';
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '2533018119@qq.com').trim().toLowerCase();
 const now = () => new Date().toISOString();
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -82,6 +83,18 @@ exports.main = async (event) => {
       await db.collection('cp_codes').doc(code._id).update({ usedAt: now(), usedBy: user._id });
       await db.collection('cp_users').doc(user._id).update({ vipExpiresAt });
       return reply(event, { vipExpiresAt });
+    }
+    if (method === 'POST' && path === '/admin/issue-code') {
+      if (user.email !== ADMIN_EMAIL) return reply(event, { error: '只有管理员账号可以发卡。' }, 403);
+      const durationDays = Number(body.durationDays) === 90 ? 90 : 30;
+      const code = `PAW-${crypto.randomBytes(8).toString('hex').toUpperCase().match(/.{1,4}/g).join('-')}`;
+      await db.collection('cp_codes').add({
+        codeHash: sha256(code),
+        durationDays,
+        createdAt: now(),
+        issuedBy: user._id
+      });
+      return reply(event, { code, durationDays }, 201);
     }
     if (method === 'POST' && path === '/pet-license') {
       if (!user.vipExpiresAt || new Date(user.vipExpiresAt) <= new Date()) {
