@@ -2,8 +2,6 @@ const tcb = require('@cloudbase/node-sdk');
 const crypto = require('crypto');
 const app = tcb.init({ env: tcb.SYMBOL_CURRENT_ENV });
 const db = app.database();
-const SHARED_MEMBERSHIP_API = 'https://cloud-paw-vip-api.cloud-paw-vip-080805liang.workers.dev';
-
 const WEB_ORIGIN = 'https://080805liang-source.github.io';
 const now = () => new Date().toISOString();
 const random = () => crypto.randomBytes(32).toString('hex');
@@ -17,22 +15,6 @@ const headers = (origin) => ({
   'access-control-allow-headers': 'content-type, authorization'
 });
 const reply = (event, body, statusCode = 200) => ({ statusCode, headers: headers(event.headers?.origin || ''), body: JSON.stringify(body) });
-const proxyMembershipRequest = async (event, path) => {
-  const method = String(event.httpMethod || 'GET').toUpperCase();
-  const upstream = await fetch(`${SHARED_MEMBERSHIP_API}${path}`, {
-    method,
-    headers: {
-      'content-type': event.headers?.['content-type'] || 'application/json',
-      ...(event.headers?.authorization ? { authorization: event.headers.authorization } : {})
-    },
-    body: ['GET', 'HEAD'].includes(method) ? undefined : event.body || undefined
-  });
-  return {
-    statusCode: upstream.status,
-    headers: headers(event.headers?.origin || ''),
-    body: await upstream.text()
-  };
-};
 const getOne = async (collection, where) => {
   const result = await db.collection(collection).where(where).limit(1).get();
   return result.data?.[0] || null;
@@ -66,8 +48,6 @@ exports.main = async (event) => {
   const origin = event.headers?.origin || '';
   if (origin && !isAllowedOrigin(origin)) return reply(event, { error: '来源不被允许。' }, 403);
   try {
-    return await proxyMembershipRequest(event, path);
-    // The code below remains as the migration target for a future fully domestic data store.
     if (path === '/health') return reply(event, { ok: true, region: 'cn' });
     const body = readBody(event);
     if (method === 'POST' && path === '/auth/signup') {
@@ -102,6 +82,42 @@ exports.main = async (event) => {
       await db.collection('cp_codes').doc(code._id).update({ usedAt: now(), usedBy: user._id });
       await db.collection('cp_users').doc(user._id).update({ vipExpiresAt });
       return reply(event, { vipExpiresAt });
+    }
+    if (method === 'POST' && path === '/pet-license') {
+      if (!user.vipExpiresAt || new Date(user.vipExpiresAt) <= new Date()) {
+        return reply(event, { error: '请先兑换有效 VIP，再生成桌面宠物。' }, 403);
+      }
+      const fingerprint = String(body.fingerprint || '').toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
+        return reply(event, { error: '桌面宠物文件校验失败，请重新生成。' }, 400);
+      }
+      const existing = await getOne('cp_desktop_licenses', { userId: user._id, fingerprint });
+      if (existing) return reply(event, { licenseId: existing.licenseId, vipExpiresAt: user.vipExpiresAt });
+      const licenseId = `pet_${random()}`;
+      await db.collection('cp_desktop_licenses').add({
+        licenseId,
+        userId: user._id,
+        fingerprint,
+        deviceHash: null,
+        createdAt: now()
+      });
+      return reply(event, { licenseId, vipExpiresAt: user.vipExpiresAt }, 201);
+    }
+    if (method === 'POST' && path === '/pet-license/verify') {
+      const licenseId = String(body.licenseId || '');
+      const fingerprint = String(body.fingerprint || '').toLowerCase();
+      const deviceHash = String(body.deviceHash || '').toLowerCase();
+      if (!licenseId || !/^[a-f0-9]{64}$/.test(fingerprint) || !/^[a-f0-9]{64}$/.test(deviceHash)) {
+        return reply(event, { active: false, error: '桌面宠物授权信息无效。' }, 400);
+      }
+      const license = await getOne('cp_desktop_licenses', { licenseId });
+      if (!license || license.fingerprint !== fingerprint || (license.deviceHash && license.deviceHash !== deviceHash)) {
+        return reply(event, { active: false }, 403);
+      }
+      const owner = await getOne('cp_users', { _id: license.userId });
+      if (!owner?.vipExpiresAt || new Date(owner.vipExpiresAt) <= new Date()) return reply(event, { active: false }, 403);
+      if (!license.deviceHash) await db.collection('cp_desktop_licenses').doc(license._id).update({ deviceHash, activatedAt: now() });
+      return reply(event, { active: true, vipExpiresAt: owner.vipExpiresAt });
     }
     if (path === '/memorial' && method === 'GET') {
       const memorial = await getOne('cp_memorials', { userId: user._id });
