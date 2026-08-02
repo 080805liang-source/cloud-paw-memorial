@@ -8,7 +8,7 @@ const now = () => new Date().toISOString();
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 const passwordHash = (password, salt) => crypto.pbkdf2Sync(String(password), salt, 100000, 32, 'sha256').toString('hex');
-const isAllowedOrigin = (origin) => origin === WEB_ORIGIN || /^https:\/\/cloud-paw-vip-cn-d0eub7r110788a3(?:-[a-z0-9]+)?(?:\.ap-shanghai)?\.(?:app\.tcloudbase\.com|tcloudbaseapp\.com)$/i.test(origin);
+const isAllowedOrigin = (origin) => origin === 'null' || origin === WEB_ORIGIN || /^https:\/\/cloud-paw-vip-cn-d0eub7r110788a3(?:-[a-z0-9]+)?(?:\.ap-shanghai)?\.(?:app\.tcloudbase\.com|tcloudbaseapp\.com)$/i.test(origin);
 const headers = (origin) => ({
   'content-type': 'application/json; charset=utf-8',
   'access-control-allow-origin': isAllowedOrigin(origin) ? origin : WEB_ORIGIN,
