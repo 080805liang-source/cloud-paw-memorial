@@ -49,6 +49,7 @@ async function createSession(userId) {
 }
 const phonePattern = /^1\d{10}$/;
 const smsConfigReady = () => Boolean(process.env.TENCENTCLOUD_SECRET_ID && process.env.TENCENTCLOUD_SECRET_KEY && process.env.SMS_SDK_APP_ID && process.env.SMS_SIGN_NAME && process.env.SMS_TEMPLATE_ID);
+const emailConfigReady = () => Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
 function tencentSmsSignature(payload, timestamp) {
   const host = 'sms.tencentcloudapi.com';
   const service = 'sms';
@@ -89,10 +90,35 @@ function sendSmsCode(phone, code) {
     request.on('error', reject); request.write(payload); request.end();
   });
 }
+function sendEmailCode(email, code) {
+  if (!emailConfigReady()) throw new Error('邮箱验证码服务尚未配置，请先联系管理员。');
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify({
+      from: process.env.EMAIL_FROM,
+      to: [email],
+      subject: 'PET FORGE 邮箱验证码',
+      html: `<p>你的 PET FORGE 注册验证码是：</p><p style="font-size:28px;font-weight:700;letter-spacing:8px">${code}</p><p>验证码 10 分钟内有效。如非本人操作，请忽略此邮件。</p>`
+    });
+    const request = https.request({ hostname: 'api.resend.com', path: '/emails', method: 'POST', headers: {
+      'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${process.env.RESEND_API_KEY}`
+    }}, (response) => {
+      let data = '';
+      response.on('data', (chunk) => { data += chunk; });
+      response.on('end', () => { if (response.statusCode >= 200 && response.statusCode < 300) resolve(); else { try { reject(new Error(JSON.parse(data).message || '邮件服务返回错误。')); } catch (_) { reject(new Error('邮件服务返回错误。')); } } });
+    });
+    request.on('error', reject); request.write(payload); request.end();
+  });
+}
 async function verifySmsCode(phone, code) {
   const record = await getOne('cp_sms_codes', { phone, codeHash: sha256(code) });
   if (!record || record.usedAt || new Date(record.expiresAt) <= new Date()) return false;
   await db.collection('cp_sms_codes').doc(record._id).update({ usedAt: now() });
+  return true;
+}
+async function verifyEmailCode(email, code) {
+  const record = await getOne('cp_email_codes', { email, codeHash: sha256(code) });
+  if (!record || record.usedAt || new Date(record.expiresAt) <= new Date()) return false;
+  await db.collection('cp_email_codes').doc(record._id).update({ usedAt: now() });
   return true;
 }
 
@@ -114,6 +140,15 @@ exports.main = async (event) => {
       await db.collection('cp_sms_codes').add({ phone, codeHash: sha256(code), expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(), createdAt: now() });
       return reply(event, { ok: true });
     }
+    if (method === 'POST' && path === '/auth/send-email-code') {
+      const email = String(body.email || '').trim().toLowerCase();
+      if (!/^\S+@\S+\.\S+$/.test(email)) return reply(event, { error: '邮箱格式不正确。' }, 400);
+      if (!emailConfigReady()) return reply(event, { error: '邮箱验证码服务尚未配置，请先联系管理员。' }, 503);
+      const code = String(crypto.randomInt(100000, 1000000));
+      try { await sendEmailCode(email, code); } catch (error) { return reply(event, { error: `验证码发送失败：${error.message}` }, 502); }
+      await db.collection('cp_email_codes').add({ email, codeHash: sha256(code), expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(), createdAt: now() });
+      return reply(event, { ok: true });
+    }
     if (method === 'POST' && path === '/auth/signup') {
       const identity = String(body.identity || 'email');
       const email = String(body.email || '').trim().toLowerCase();
@@ -122,14 +157,15 @@ exports.main = async (event) => {
       if (password.length < 8 || password !== String(body.confirmPassword || '')) return reply(event, { error: '密码至少 8 位，且两次输入必须一致。' }, 400);
       if (identity === 'phone') {
         if (!phonePattern.test(phone)) return reply(event, { error: '请输入有效手机号。' }, 400);
-        if (!await verifySmsCode(phone, String(body.smsCode || '').trim())) return reply(event, { error: '验证码错误或已过期。' }, 400);
         if (await getOne('cp_users', { phone })) return reply(event, { error: '这个手机号已经注册，请直接登录。' }, 409);
+        if (!await verifySmsCode(phone, String(body.smsCode || '').trim())) return reply(event, { error: '验证码错误或已过期。' }, 400);
       } else {
         if (!/^\S+@\S+\.\S+$/.test(email)) return reply(event, { error: '请填写有效邮箱。' }, 400);
         if (await getOne('cp_users', { email })) return reply(event, { error: '这个邮箱已经注册，请直接登录。' }, 409);
+        if (!await verifyEmailCode(email, String(body.emailCode || '').trim())) return reply(event, { error: '邮箱验证码错误或已过期。' }, 400);
       }
       const salt = random();
-      const added = await db.collection('cp_users').add({ email: identity === 'email' ? email : null, phone: identity === 'phone' ? phone : null, passwordHash: passwordHash(password, salt), passwordSalt: salt, credits: 0, createdAt: now() });
+      const added = await db.collection('cp_users').add({ email: identity === 'email' ? email : null, phone: identity === 'phone' ? phone : null, emailVerifiedAt: identity === 'email' ? now() : null, phoneVerifiedAt: identity === 'phone' ? now() : null, passwordHash: passwordHash(password, salt), passwordSalt: salt, credits: 0, createdAt: now() });
       const user = { _id: added.id || added._id, email, phone, credits: 0 };
       return reply(event, { token: await createSession(user._id), user: publicUser(user) }, 201);
     }
