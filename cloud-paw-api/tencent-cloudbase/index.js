@@ -4,8 +4,14 @@ const https = require('https');
 const app = tcb.init({ env: tcb.SYMBOL_CURRENT_ENV });
 const db = app.database();
 const WEB_ORIGIN = 'https://080805liang-source.github.io';
-// 店主账号：可确认支付宝订单并直接测试。
-const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '3903345807@qq.com').trim().toLowerCase();
+// 店主账号：固定保留，避免部署环境变量误配置导致管理员权限丢失。
+const ADMIN_EMAILS = new Set([
+  '3903345807@qq.com',
+  ...String(process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '')
+    .split(',')
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+]);
 const now = () => new Date().toISOString();
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -26,7 +32,7 @@ const getOne = async (collection, where) => {
   return result.data?.[0] || null;
 };
 const readBody = (event) => { try { return JSON.parse(event.body || '{}'); } catch (_) { return {}; } };
-const isAdmin = (user) => String(user?.email || '').trim().toLowerCase() === ADMIN_EMAIL;
+const isAdmin = (user) => ADMIN_EMAILS.has(String(user?.email || '').trim().toLowerCase());
 const publicUser = (user) => ({ id: user._id, email: user.email || null, phone: user.phone || null, credits: Number(user.credits || 0), isAdmin: isAdmin(user) });
 const plusDays = (oldExpiry, days) => {
   const base = oldExpiry && new Date(oldExpiry) > new Date() ? new Date(oldExpiry) : new Date();
