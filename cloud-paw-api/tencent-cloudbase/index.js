@@ -16,6 +16,8 @@ const ADMIN_EMAILS = new Set([
 const now = () => new Date().toISOString();
 const ADMIN_EVENTS = 'cp_admin_events';
 const FEEDBACK = 'cp_feedback';
+const WORKSHOP = 'pf_workshop';
+const WORKSHOP_UPLOADS = 'pf_workshop_uploads';
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 const passwordHash = (password, salt) => crypto.pbkdf2Sync(String(password), salt, 100000, 32, 'sha256').toString('hex');
@@ -71,9 +73,16 @@ function maskPhone(phone) { return phone ? `${String(phone).slice(0, 3)}****${St
 function adminUserSummary(user) {
   return { id: user._id, identity: user.email ? maskEmail(user.email) : maskPhone(user.phone), createdAt: user.createdAt || null, usageCount: Number(user.usageCount || 0), credits: Number(user.credits || 0), isAdmin: isAdmin(user), vipExpiresAt: user.vipExpiresAt || null, membershipActive: hasMembership(user) };
 }
-async function recordGeneration(user) {
+async function recordGeneration(user, workshopId = '') {
   await ensureCollection(ADMIN_EVENTS);
+  if (workshopId) await ensureCollection(WORKSHOP);
   return db.runTransaction(async (transaction) => {
+    if (workshopId) {
+      const item = await transaction.collection(WORKSHOP).doc(workshopId).get();
+      const post = Array.isArray(item.data) ? item.data[0] : item.data;
+      if (!post?.isPublic) throw Object.assign(new Error('这个作品已取消分享。'), { status: 404 });
+      await transaction.collection(WORKSHOP).doc(workshopId).update({ downloads: db.command.inc(1) });
+    }
     const result = await transaction.collection('cp_users').doc(user._id).get();
     const current = Array.isArray(result.data) ? result.data[0] : result.data;
     const currentCredits = Number(current?.credits || 0);
@@ -84,6 +93,42 @@ async function recordGeneration(user) {
     await transaction.collection(ADMIN_EVENTS).add({ type: 'generation', userId: user._id, day: shanghaiDay(), createdAt: now() });
     return credits;
   });
+}
+
+function workshopImage(value, maxBytes, maxSide) {
+  if (typeof value !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length > maxBytes * 1.4 + 32) throw Object.assign(new Error('作品图片需为透明 PNG，且不能超过大小限制。'), { status: 400 });
+  const bytes = Buffer.from(value.slice(22), 'base64');
+  if (bytes.length > maxBytes || bytes.length < 33 || bytes.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a' || bytes.toString('ascii', 12, 16) !== 'IHDR') throw Object.assign(new Error('作品图片不是有效的 PNG。'), { status: 400 });
+  const width = bytes.readUInt32BE(16), height = bytes.readUInt32BE(20);
+  if (!width || !height || width > maxSide || height > maxSide) throw Object.assign(new Error('作品图片尺寸过大。'), { status: 400 });
+  return `data:image/png;base64,${bytes.toString('base64')}`;
+}
+
+function workshopConfig(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || JSON.stringify(input).length > 32000) throw Object.assign(new Error('作品配置无效或过大。'), { status: 400 });
+  const result = {};
+  const fields = ['name','image','size','opacity','clickLine','status','clickAnimation','bubbleStyle','position','alwaysOnTop','desktopOnly','shadow','motionEnabled','hoverEffect','leaveEffect','idleBehavior','doubleClickEffect','cursorFollowMode','proactiveFrequency','keyboardReaction','wanderEnabled','hoverBubble','clickParticles','soundHint','keyboardSync','interactionNote','visualStyle'];
+  for (const key of fields) {
+    const value = input[key];
+    if (['string', 'number', 'boolean'].includes(typeof value)) result[key] = value;
+  }
+  for (const [key, min, max] of [['size',70,140],['opacity',72,100]]) if (!Number.isFinite(result[key]) || result[key] < min || result[key] > max) throw Object.assign(new Error('作品的大小或透明度配置无效。'), { status: 400 });
+  if (!String(result.name || '').trim() || String(result.name).length > 80) throw Object.assign(new Error('请填写作品名称。'), { status: 400 });
+  const shortcuts = input.customShortcuts || [];
+  if (!Array.isArray(shortcuts) || shortcuts.length > 20) throw Object.assign(new Error('快捷入口最多 20 项。'), { status: 400 });
+  result.customShortcuts = shortcuts.map((item) => {
+    if (!item || !['file','folder','url','app'].includes(item.type) || typeof item.target !== 'string' || /^(?:javascript|data|vbscript):/i.test(item.target.trim())) throw Object.assign(new Error('作品包含无效的快捷入口。'), { status: 400 });
+    const clean = {};
+    for (const key of ['id','label','type','target','fallback']) if (typeof item[key] === 'string') clean[key] = item[key].slice(0, 1024);
+    if (Array.isArray(item.appPaths)) clean.appPaths = item.appPaths.filter((path) => typeof path === 'string').slice(0, 10).map((path) => path.slice(0, 1024));
+    return clean;
+  });
+  return { ...result, image: 'pet.png', safeRendering: false, targetFps: 60 };
+}
+
+function publicWorkshop(post, full = false) {
+  return { id: post._id, authorId: post.userId, author: post.author, title: post.title, description: post.description || '', preview: post.preview, style: post.style || 'original', downloads: Number(post.downloads || 0), createdAt: post.createdAt,
+    ...(full ? { image: post.image, imageSha256: post.imageSha256, config: post.config } : {}) };
 }
 const plusDays = (oldExpiry, days) => {
   const base = oldExpiry && new Date(oldExpiry) > new Date() ? new Date(oldExpiry) : new Date();
@@ -188,9 +233,23 @@ exports.main = async (event) => {
   const origin = event.headers?.origin || '';
   if (origin && !isAllowedOrigin(origin)) return reply(event, { error: '来源不被允许。' }, 403);
   try {
-    if (path === '/health') return reply(event, { ok: true, region: 'cn', release: 'redeem-20261107' });
+    if (path === '/health') return reply(event, { ok: true, region: 'cn', release: 'workshop-20261107' });
     if (method === 'POST' && ['/orders', '/admin/confirm-order'].includes(path)) return reply(event, { error: '站内支付已关闭，请登录后兑换会员码。' }, 410);
     const body = readBody(event);
+    if (method === 'GET' && path === '/workshop') {
+      await ensureCollection(WORKSHOP);
+      const offset = Math.max(0, Math.floor(Number(query.offset) || 0));
+      const limit = Math.min(12, Math.max(1, Math.floor(Number(query.limit) || 12)));
+      const order = query.sort === 'popular' ? 'downloads' : 'createdAt';
+      const posts = await db.collection(WORKSHOP).where({ isPublic: true }).field({ image: false, config: false }).orderBy(order, 'desc').skip(offset).limit(limit).get();
+      return reply(event, { posts: posts.data.map((post) => publicWorkshop(post)), total: await countWhere(WORKSHOP, { isPublic: true }), offset, limit });
+    }
+    const workshopMatch = path.match(/^\/workshop\/([a-zA-Z0-9_-]{1,80})$/);
+    if (method === 'GET' && workshopMatch) {
+      await ensureCollection(WORKSHOP);
+      const post = await getOne(WORKSHOP, { _id: workshopMatch[1], isPublic: true });
+      return post ? reply(event, { post: publicWorkshop(post, true) }) : reply(event, { error: '这个作品不存在或已取消分享。' }, 404);
+    }
     if (method === 'POST' && path === '/auth/send-code') {
       const phone = String(body.phone || '').trim();
       if (!phonePattern.test(phone)) return reply(event, { error: '手机号格式不正确。' }, 400);
@@ -251,13 +310,61 @@ exports.main = async (event) => {
     }
     const user = await sessionUser(event);
     if (!user) return reply(event, { error: '请先登录。' }, 401);
+    if (method === 'POST' && path === '/workshop/upload') {
+      const { uploadId, index, total, data } = body;
+      if (!/^[a-f0-9]{32}$/.test(String(uploadId)) || !Number.isInteger(index) || !Number.isInteger(total) || total < 1 || total > 40 || index < 0 || index >= total || typeof data !== 'string' || !data.length || data.length > 24000) return reply(event, { error: '上传分片参数无效。' }, 400);
+      await ensureCollection(WORKSHOP_UPLOADS);
+      const id = sha256(`${user._id}:${uploadId}:${index}`);
+      const old = await getOne(WORKSHOP_UPLOADS, { _id: id });
+      if (old && (old.data !== data || old.total !== total)) return reply(event, { error: '上传内容不一致，请重新发布。' }, 400);
+      if (!old) await db.collection(WORKSHOP_UPLOADS).add({ _id: id, userId: user._id, uploadId, index, total, data, createdAt: now() });
+      return reply(event, { ok: true });
+    }
+    if (method === 'POST' && path === '/workshop') {
+      let payload = body, chunks = [];
+      if (body.uploadId) {
+        if (!/^[a-f0-9]{32}$/.test(String(body.uploadId))) return reply(event, { error: '上传标识无效。' }, 400);
+        await ensureCollection(WORKSHOP_UPLOADS);
+        const result = await db.collection(WORKSHOP_UPLOADS).where({ userId: user._id, uploadId: body.uploadId }).limit(40).get();
+        chunks = result.data.sort((a, b) => a.index - b.index);
+        if (!chunks.length || chunks.length !== chunks[0].total || chunks.some((chunk, index) => chunk.index !== index || chunk.total !== chunks.length || Date.now() - new Date(chunk.createdAt).getTime() > 1800000)) return reply(event, { error: '图片上传未完成或已过期，请重新发布。' }, 400);
+        try { payload = JSON.parse(chunks.map((chunk) => chunk.data).join('')); } catch (_) { return reply(event, { error: '上传内容不完整，请重试。' }, 400); }
+      }
+      const config = workshopConfig(payload.config);
+      const image = workshopImage(payload.image, 512 * 1024, 1024);
+      const preview = workshopImage(payload.preview, 128 * 1024, 256);
+      const description = String(payload.description || '').trim().slice(0, 600);
+      const contentHash = sha256(JSON.stringify([config, image, description]));
+      await ensureCollection(WORKSHOP);
+      const existing = await getOne(WORKSHOP, { userId: user._id, contentHash });
+      if (existing) {
+        if (!existing.isPublic) await db.collection(WORKSHOP).doc(existing._id).update({ isPublic: true });
+        await Promise.all(chunks.map((chunk) => db.collection(WORKSHOP_UPLOADS).doc(chunk._id).remove()));
+        return reply(event, { id: existing._id, duplicate: true }, 201);
+      }
+      const bytes = Buffer.from(image.slice(22), 'base64');
+      const post = { userId: user._id, author: `创作者 ${user._id.slice(-6)}`, title: config.name, description, config, image, preview, imageSha256: crypto.createHash('sha256').update(bytes).digest('hex'), contentHash, style: config.visualStyle || 'original', downloads: 0, isPublic: true, createdAt: now() };
+      const saved = await db.collection(WORKSHOP).add(post);
+      await Promise.all(chunks.map((chunk) => db.collection(WORKSHOP_UPLOADS).doc(chunk._id).remove()));
+      return reply(event, { id: saved.id || saved._id }, 201);
+    }
+    if (method === 'PUT' && workshopMatch) {
+      const post = await getOne(WORKSHOP, { _id: workshopMatch[1] });
+      if (!post) return reply(event, { error: '作品不存在。' }, 404);
+      if (post.userId !== user._id && !isAdmin(user)) return reply(event, { error: '只能取消自己作品的分享。' }, 403);
+      if (body.isPublic !== false) return reply(event, { error: '作品状态无效。' }, 400);
+      await db.collection(WORKSHOP).doc(post._id).update({ isPublic: false });
+      return reply(event, { ok: true });
+    }
     if (method === 'GET' && path === '/me') return reply(event, { user: publicUser(user) });
     if (method === 'POST' && path === '/consume') {
       const amount = Number(body.amount) === 1 ? 1 : 0;
       if (!amount) return reply(event, { error: '使用次数参数无效。' }, 400);
       let credits;
-      try { credits = await recordGeneration(user); }
-      catch (error) { if (error.status === 403) return reply(event, { error: error.message }, 403); throw error; }
+      const workshopId = String(body.workshopId || '');
+      if (workshopId && !/^[a-zA-Z0-9_-]{1,80}$/.test(workshopId)) return reply(event, { error: '作品参数无效。' }, 400);
+      try { credits = await recordGeneration(user, workshopId); }
+      catch (error) { if ([403,404].includes(error.status)) return reply(event, { error: error.message }, error.status); throw error; }
       return reply(event, { credits, unlimited: isAdmin(user) || hasMembership(user) });
     }
     if (method === 'POST' && path === '/feedback') {
@@ -424,6 +531,7 @@ exports.main = async (event) => {
     }
     return reply(event, { error: '接口不存在。' }, 404);
   } catch (error) {
+    if (error.status === 400) return reply(event, { error: error.message }, 400);
     console.error(error);
     return reply(event, { error: '会员服务暂时繁忙，请稍后再试。' }, 500);
   }
