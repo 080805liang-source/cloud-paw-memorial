@@ -29,7 +29,7 @@ const isAllowedOrigin = (origin) => origin === 'null'
 const headers = (origin) => ({
   'content-type': 'application/json; charset=utf-8',
   'access-control-allow-origin': isAllowedOrigin(origin) ? origin : WEB_ORIGIN,
-  'access-control-allow-methods': 'GET, POST, PUT, OPTIONS',
+  'access-control-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'access-control-allow-headers': 'content-type, authorization'
 });
 const reply = (event, body, statusCode = 200) => ({ statusCode, headers: headers(event.headers?.origin || ''), body: JSON.stringify(body) });
@@ -355,6 +355,13 @@ exports.main = async (event) => {
       const saved = await db.collection(WORKSHOP).add(post);
       await Promise.all(chunks.map((chunk) => db.collection(WORKSHOP_UPLOADS).doc(chunk._id).remove()));
       return reply(event, { id: saved.id || saved._id }, 201);
+    }
+    if (method === 'DELETE' && workshopMatch) {
+      const post = await getOne(WORKSHOP, { _id: workshopMatch[1] });
+      if (!post) return reply(event, { error: '作品不存在。' }, 404);
+      if (post.userId !== user._id && !isAdmin(user)) return reply(event, { error: '只能删除自己的作品。' }, 403);
+      await db.collection(WORKSHOP).doc(post._id).remove();
+      return reply(event, { ok: true });
     }
     if (method === 'PUT' && workshopMatch) {
       const post = await getOne(WORKSHOP, { _id: workshopMatch[1] });
