@@ -123,7 +123,7 @@ function workshopConfig(input) {
     if (Array.isArray(item.appPaths)) clean.appPaths = item.appPaths.filter((path) => typeof path === 'string').slice(0, 10).map((path) => path.slice(0, 1024));
     return clean;
   });
-  return { ...result, image: 'pet.png', safeRendering: false, targetFps: 60 };
+  return { ...result, image: 'pet.png', safeRendering: false, targetFps: 120 };
 }
 
 function publicWorkshop(post, full = false) {
