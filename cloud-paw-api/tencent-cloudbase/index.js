@@ -123,11 +123,13 @@ function workshopConfig(input) {
     if (Array.isArray(item.appPaths)) clean.appPaths = item.appPaths.filter((path) => typeof path === 'string').slice(0, 10).map((path) => path.slice(0, 1024));
     return clean;
   });
+  if (/^animal-\d{1,12}$/.test(input.animationPreset || '')) result.animationPreset = input.animationPreset;
+  if (typeof input.assetAttribution === 'string') result.assetAttribution = input.assetAttribution.slice(0,8000);
   return { ...result, image: 'pet.png', safeRendering: false, targetFps: 120 };
 }
 
 function publicWorkshop(post, full = false) {
-  return { id: post._id, authorId: post.userId, author: post.author, title: post.title, description: post.description || '', preview: post.preview, style: post.style || 'original', downloads: Number(post.downloads || 0), createdAt: post.createdAt,
+  return { id: post._id, authorId: post.userId, author: post.author, title: post.title, description: post.description || '', preview: post.preview, category: post.category || 'community', animated: post.animated === true, curated: post.curated === true, shortcutCount: post.config?.customShortcuts?.length || post.shortcutCount || 0, style: post.style || 'original', downloads: Number(post.downloads || 0), createdAt: post.createdAt,
     ...(full ? { image: post.image, imageSha256: post.imageSha256, config: post.config } : {}) };
 }
 const plusDays = (oldExpiry, days) => {
@@ -239,10 +241,16 @@ exports.main = async (event) => {
     if (method === 'GET' && path === '/workshop') {
       await ensureCollection(WORKSHOP);
       const offset = Math.max(0, Math.floor(Number(query.offset) || 0));
-      const limit = Math.min(12, Math.max(1, Math.floor(Number(query.limit) || 12)));
+      const limit = Math.min(24, Math.max(1, Math.floor(Number(query.limit) || 12)));
       const order = query.sort === 'popular' ? 'downloads' : 'createdAt';
-      const posts = await db.collection(WORKSHOP).where({ isPublic: true }).field({ image: false, config: false }).orderBy(order, 'desc').skip(offset).limit(limit).get();
-      return reply(event, { posts: posts.data.map((post) => publicWorkshop(post)), total: await countWhere(WORKSHOP, { isPublic: true }), offset, limit });
+      const base = {isPublic:true};
+      if (['animal','anime'].includes(query.category)) base.category = query.category;
+      else if (query.category === 'community') base.curated = db.command.neq(true);
+      const term = String(query.q || '').trim().slice(0,80);
+      const expression = term ? db.RegExp({regexp:term.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),options:'i'}) : null;
+      const conditions = expression ? db.command.and([base,db.command.or([{title:expression},{description:expression},{author:expression}])]) : base;
+      const posts = await db.collection(WORKSHOP).where(conditions).field({ image: false, config: false }).orderBy(order, 'desc').skip(offset).limit(limit).get();
+      return reply(event, { posts: posts.data.map((post) => publicWorkshop(post)), total: await countWhere(WORKSHOP, conditions), offset, limit });
     }
     const workshopMatch = path.match(/^\/workshop\/([a-zA-Z0-9_-]{1,80})$/);
     if (method === 'GET' && workshopMatch) {
