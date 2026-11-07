@@ -14,6 +14,8 @@ const ADMIN_EMAILS = new Set([
     .filter(Boolean)
 ]);
 const now = () => new Date().toISOString();
+const ADMIN_EVENTS = 'cp_admin_events';
+const FEEDBACK = 'cp_feedback';
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 const passwordHash = (password, salt) => crypto.pbkdf2Sync(String(password), salt, 100000, 32, 'sha256').toString('hex');
@@ -35,7 +37,54 @@ const getOne = async (collection, where) => {
 };
 const readBody = (event) => { try { return JSON.parse(event.body || '{}'); } catch (_) { return {}; } };
 const isAdmin = (user) => ADMIN_EMAILS.has(String(user?.email || '').trim().toLowerCase());
-const publicUser = (user) => ({ id: user._id, email: user.email || null, phone: user.phone || null, credits: Number(user.credits || 0), isAdmin: isAdmin(user) });
+const hasMembership = (user) => Boolean(user?.vipExpiresAt && new Date(user.vipExpiresAt) > new Date());
+const publicUser = (user) => ({ id: user._id, email: user.email || null, phone: user.phone || null, credits: Number(user.credits || 0), isAdmin: isAdmin(user), membershipActive: hasMembership(user), vipExpiresAt: user.vipExpiresAt || null });
+const readyCollections = new Set();
+async function ensureCollection(name) {
+  if (readyCollections.has(name)) return;
+  if (typeof db.createCollectionIfNotExists === 'function') await db.createCollectionIfNotExists(name);
+  else if (typeof db.createCollection === 'function') {
+    try { await db.createCollection(name); }
+    catch (error) { if (!/exist|duplicate|409/i.test(`${error.code || ''} ${error.message || ''}`)) throw error; }
+  } else throw new Error('数据库不支持创建集合。');
+  readyCollections.add(name);
+}
+async function countWhere(collection, conditions = {}) {
+  const result = await db.collection(collection).where(conditions).count();
+  return Number(result.total ?? result.data?.total ?? 0);
+}
+function shanghaiDay(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+function shanghaiDayStart(day) {
+  const [year, month, date] = day.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, date) - 8 * 60 * 60 * 1000).toISOString();
+}
+function maskEmail(email) {
+  if (!email) return '';
+  const [local, domain] = String(email).split('@');
+  return `${local.slice(0, Math.min(3, local.length))}***@${domain || ''}`;
+}
+function maskPhone(phone) { return phone ? `${String(phone).slice(0, 3)}****${String(phone).slice(-4)}` : ''; }
+function adminUserSummary(user) {
+  return { id: user._id, identity: user.email ? maskEmail(user.email) : maskPhone(user.phone), createdAt: user.createdAt || null, usageCount: Number(user.usageCount || 0), credits: Number(user.credits || 0), isAdmin: isAdmin(user), vipExpiresAt: user.vipExpiresAt || null, membershipActive: hasMembership(user) };
+}
+async function recordGeneration(user) {
+  await ensureCollection(ADMIN_EVENTS);
+  return db.runTransaction(async (transaction) => {
+    const result = await transaction.collection('cp_users').doc(user._id).get();
+    const current = Array.isArray(result.data) ? result.data[0] : result.data;
+    const currentCredits = Number(current?.credits || 0);
+    const unlimited = isAdmin(current) || hasMembership(current);
+    if (!unlimited && currentCredits < 1) throw Object.assign(new Error('请先兑换会员码，再继续使用。'), { status: 403 });
+    const credits = unlimited ? currentCredits : currentCredits - 1;
+    await transaction.collection('cp_users').doc(user._id).update({ credits, usageCount: db.command.inc(1) });
+    await transaction.collection(ADMIN_EVENTS).add({ type: 'generation', userId: user._id, day: shanghaiDay(), createdAt: now() });
+    return credits;
+  });
+}
 const plusDays = (oldExpiry, days) => {
   const base = oldExpiry && new Date(oldExpiry) > new Date() ? new Date(oldExpiry) : new Date();
   base.setDate(base.getDate() + Number(days));
@@ -132,12 +181,15 @@ async function verifyEmailCode(email, code) {
 
 exports.main = async (event) => {
   const method = String(event.httpMethod || 'GET').toUpperCase();
-  const path = String(event.path || '/').replace(/^\/api/, '') || '/';
+  const parsedUrl = new URL(String(event.path || '/'), 'https://petforge.invalid');
+  const path = parsedUrl.pathname.replace(/^\/api(?=\/|$)/, '') || '/';
+  const query = event.queryStringParameters || Object.fromEntries(parsedUrl.searchParams);
   if (method === 'OPTIONS') return { statusCode: 204, headers: headers(event.headers?.origin || ''), body: '' };
   const origin = event.headers?.origin || '';
   if (origin && !isAllowedOrigin(origin)) return reply(event, { error: '来源不被允许。' }, 403);
   try {
-    if (path === '/health') return reply(event, { ok: true, region: 'cn' });
+    if (path === '/health') return reply(event, { ok: true, region: 'cn', release: 'redeem-20261107' });
+    if (method === 'POST' && ['/orders', '/admin/confirm-order'].includes(path)) return reply(event, { error: '站内支付已关闭，请登录后兑换会员码。' }, 410);
     const body = readBody(event);
     if (method === 'POST' && path === '/auth/send-code') {
       const phone = String(body.phone || '').trim();
@@ -185,6 +237,13 @@ exports.main = async (event) => {
       if (!user || passwordHash(body.password || '', user.passwordSalt) !== user.passwordHash) return reply(event, { error: '账号或密码不正确。' }, 401);
       return reply(event, { token: await createSession(user._id), user: publicUser(user) });
     }
+    if (method === 'POST' && path === '/analytics/pageview') {
+      const page = String(body.page || '');
+      if (!['home', 'creator', 'workshop', 'support'].includes(page)) return reply(event, { error: '页面参数无效。' }, 400);
+      await ensureCollection(ADMIN_EVENTS);
+      await db.collection(ADMIN_EVENTS).add({ type: 'page_view', page, day: shanghaiDay(), createdAt: now() });
+      return reply(event, { ok: true }, 202);
+    }
     if (method === 'POST' && path === '/auth/logout') {
       const token = String(event.headers?.authorization || '').replace(/^Bearer\s+/i, '');
       if (token) { const old = await getOne('cp_sessions', { token }); if (old) await db.collection('cp_sessions').doc(old._id).remove(); }
@@ -194,53 +253,128 @@ exports.main = async (event) => {
     if (!user) return reply(event, { error: '请先登录。' }, 401);
     if (method === 'GET' && path === '/me') return reply(event, { user: publicUser(user) });
     if (method === 'POST' && path === '/consume') {
-      if (isAdmin(user)) return reply(event, { credits: Number(user.credits || 0) });
       const amount = Number(body.amount) === 1 ? 1 : 0;
-      const currentCredits = Number(user.credits || 0);
-      if (!amount || currentCredits < amount) return reply(event, { error: '可用次数不足，请先购买次数。' }, 403);
-      const credits = currentCredits - amount;
-      await db.collection('cp_users').doc(user._id).update({ credits });
-      return reply(event, { credits });
+      if (!amount) return reply(event, { error: '使用次数参数无效。' }, 400);
+      let credits;
+      try { credits = await recordGeneration(user); }
+      catch (error) { if (error.status === 403) return reply(event, { error: error.message }, 403); throw error; }
+      return reply(event, { credits, unlimited: isAdmin(user) || hasMembership(user) });
     }
-    if (method === 'POST' && path === '/orders') {
-      if (String(body.product || '') !== 'credits_3' || Number(body.amount) !== 9.9) return reply(event, { error: '购买项目无效。' }, 400);
-      const orderId = `PF${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
-      const order = { orderId, userId: user._id, product: 'credits_3', amount: 9.9, credits: 3, status: 'pending', createdAt: now() };
-      await db.collection('cp_orders').add(order);
-      return reply(event, { order: { orderId, amount: order.amount, credits: order.credits, status: order.status } }, 201);
+    if (method === 'POST' && path === '/feedback') {
+      const category = String(body.category || '');
+      const message = String(body.message || '').trim();
+      const details = String(body.details || '').trim();
+      if (!['bug', 'account', 'payment', 'idea', 'other'].includes(category)) return reply(event, { error: '请选择反馈类型。' }, 400);
+      if (message.length < 8 || message.length > 3000 || details.length > 3000) return reply(event, { error: '问题描述需为 8–3000 字，补充步骤最多 3000 字。' }, 400);
+      await ensureCollection(FEEDBACK);
+      const saved = await db.collection(FEEDBACK).add({ userId: user._id, category, message, details, contact: user.email || user.phone || '', status: 'open', createdAt: now() });
+      return reply(event, { ok: true, id: saved.id || saved._id }, 201);
     }
-    if (method === 'POST' && path === '/admin/confirm-order') {
-      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以确认订单。' }, 403);
-      const orderId = String(body.orderId || '').trim();
-      const order = await getOne('cp_orders', { orderId });
-      if (!order || order.status !== 'pending') return reply(event, { error: '订单不存在或已经处理。' }, 400);
-      const buyer = await getOne('cp_users', { _id: order.userId });
-      if (!buyer) return reply(event, { error: '订单用户不存在。' }, 400);
-      const creditsAdded = Number(order.credits || 3);
-      await db.collection('cp_users').doc(buyer._id).update({ credits: Number(buyer.credits || 0) + creditsAdded });
-      await db.collection('cp_orders').doc(order._id).update({ status: 'paid', confirmedAt: now(), confirmedBy: user._id });
-      return reply(event, { orderId, creditsAdded, status: 'paid' });
+    if (method === 'GET' && path === '/admin/overview') {
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以查看运营数据。' }, 403);
+      await Promise.all([ensureCollection(ADMIN_EVENTS), ensureCollection(FEEDBACK)]);
+      const today = shanghaiDay();
+      const todayStart = shanghaiDayStart(today);
+      const [users, generations, pageViews, todayUsers, todayGenerations, todayPageViews, openFeedback, inProgressFeedback, activeUsers] = await Promise.all([
+        countWhere('cp_users'), countWhere(ADMIN_EVENTS, { type: 'generation' }), countWhere(ADMIN_EVENTS, { type: 'page_view' }),
+        countWhere('cp_users', { createdAt: db.command.gte(todayStart) }), countWhere(ADMIN_EVENTS, { type: 'generation', day: today }),
+        countWhere(ADMIN_EVENTS, { type: 'page_view', day: today }), countWhere(FEEDBACK, { status: 'open' }), countWhere(FEEDBACK, { status: 'in_progress' }), countWhere('cp_users', { usageCount: db.command.gt(0) })
+      ]);
+      const days = Array.from({ length: 14 }, (_, index) => new Date(Date.now() - index * 86400000)).reverse().map((date) => shanghaiDay(date));
+      const activityResult = await db.collection(ADMIN_EVENTS).aggregate().match({ day: db.command.gte(days[0]) }).group({ _id: { day: '$day', type: '$type' }, total: db.command.aggregate.sum(1) }).end();
+      const activity = days.map((day) => ({ day, views: Number(activityResult.data?.find((item) => item._id.day === day && item._id.type === 'page_view')?.total || 0), generations: Number(activityResult.data?.find((item) => item._id.day === day && item._id.type === 'generation')?.total || 0) }));
+      const pageTotals = await Promise.all(['home', 'creator', 'workshop', 'support'].map(async (page) => ({ page, views: await countWhere(ADMIN_EVENTS, { type: 'page_view', page }) })));
+      return reply(event, { metrics: { users, activeUsers, generations, pageViews, openFeedback: openFeedback + inProgressFeedback, todayUsers, todayGenerations, todayPageViews }, activity, pageTotals });
+    }
+    if (method === 'GET' && path === '/admin/users') {
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以查看用户统计。' }, 403);
+      const limit = Math.max(1, Math.min(50, Math.floor(Number(query.limit) || 20)));
+      const offset = Math.max(0, Math.floor(Number(query.offset) || 0));
+      const [total, result] = await Promise.all([countWhere('cp_users'), db.collection('cp_users').orderBy('createdAt', 'desc').skip(offset).limit(limit).get()]);
+      return reply(event, { total, users: (result.data || []).map(adminUserSummary), offset, limit });
+    }
+    if (method === 'GET' && path === '/admin/feedback') {
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以查看用户反馈。' }, 403);
+      await ensureCollection(FEEDBACK);
+      const status = String(query.status || 'all');
+      const where = ['open', 'in_progress', 'resolved'].includes(status) ? { status } : {};
+      const offset = Math.max(0, Math.floor(Number(query.offset) || 0));
+      const [total, result] = await Promise.all([countWhere(FEEDBACK, where), db.collection(FEEDBACK).where(where).orderBy('createdAt', 'desc').skip(offset).limit(20).get()]);
+      return reply(event, { total, offset, limit: 20, feedback: (result.data || []).map((item) => ({ id: item._id, category: item.category, message: item.message, details: item.details, contact: item.contact, status: item.status, createdAt: item.createdAt })) });
+    }
+    const feedbackStatusMatch = path.match(/^\/admin\/feedback\/([^/]+)$/);
+    if (method === 'PUT' && feedbackStatusMatch) {
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以更新反馈状态。' }, 403);
+      const status = String(body.status || '');
+      if (!['open', 'in_progress', 'resolved'].includes(status)) return reply(event, { error: '反馈状态无效。' }, 400);
+      const id = decodeURIComponent(feedbackStatusMatch[1]);
+      const feedback = await db.collection(FEEDBACK).doc(id).get();
+      const feedbackRecord = Array.isArray(feedback.data) ? feedback.data[0] : feedback.data;
+      if (!feedbackRecord) return reply(event, { error: '未找到这条反馈。' }, 404);
+      await db.collection(FEEDBACK).doc(id).update({ status, updatedAt: now(), resolvedAt: status === 'resolved' ? now() : null });
+      return reply(event, { ok: true, status });
     }
     if (method === 'POST' && path === '/redeem') {
-      const codeHash = sha256(String(body.code || '').trim().toUpperCase());
-      const code = await getOne('cp_codes', { codeHash });
-      if (!code || code.usedAt) return reply(event, { error: '兑换码不存在、已使用或已失效。' }, 400);
-      const vipExpiresAt = plusDays(user.vipExpiresAt, code.durationDays || 30);
-      await db.collection('cp_codes').doc(code._id).update({ usedAt: now(), usedBy: user._id });
-      await db.collection('cp_users').doc(user._id).update({ vipExpiresAt });
-      return reply(event, { vipExpiresAt });
+      const input = String(body.code || '').trim().toUpperCase();
+      if (!/^PAW-(?:[A-F0-9]{4}-){3,7}[A-F0-9]{4}$/.test(input)) return reply(event, { error: '会员码格式不正确，请检查后重试。' }, 400);
+      await ensureCollection('cp_codes');
+      const code = await getOne('cp_codes', { codeHash: sha256(input) });
+      if (!code) return reply(event, { error: '会员码不存在、已使用或已停用。' }, 400);
+      try {
+        const updated = await db.runTransaction(async (transaction) => {
+          const result = await transaction.collection('cp_codes').doc(code._id).get();
+          const currentCode = Array.isArray(result.data) ? result.data[0] : result.data;
+          if (!currentCode || currentCode.usedAt || currentCode.revokedAt || (currentCode.expiresAt && new Date(currentCode.expiresAt) <= new Date())) throw Object.assign(new Error('会员码不存在、已使用或已停用。'), { status: 400 });
+          const ownerResult = await transaction.collection('cp_users').doc(user._id).get();
+          const owner = Array.isArray(ownerResult.data) ? ownerResult.data[0] : ownerResult.data;
+          const changes = currentCode.kind === 'credits' ? { credits: Number(owner.credits || 0) + Number(currentCode.credits || 3) } : { vipExpiresAt: plusDays(owner.vipExpiresAt, currentCode.durationDays || 30) };
+          await transaction.collection('cp_users').doc(user._id).update(changes);
+          await transaction.collection('cp_codes').doc(code._id).update({ usedAt: now(), usedBy: user._id });
+          return { ...owner, ...changes };
+        });
+        return reply(event, { user: publicUser(updated), credits: Number(updated.credits || 0), vipExpiresAt: updated.vipExpiresAt || null });
+      } catch (error) { if (error.status === 400) return reply(event, { error: error.message }, 400); throw error; }
     }
     if (method === 'POST' && path === '/admin/issue-code') {
-      if (!isAdmin(user)) return reply(event, { error: '只有管理员账号可以发卡。' }, 403);
-      const durationDays = Number(body.durationDays) === 90 ? 90 : 30;
-      const code = `PAW-${crypto.randomBytes(8).toString('hex').toUpperCase().match(/.{1,4}/g).join('-')}`;
-      await db.collection('cp_codes').add({
-        codeHash: sha256(code),
-        durationDays,
-        createdAt: now(),
-        issuedBy: user._id
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以生成会员码。' }, 403);
+      const kind = String(body.kind || 'membership');
+      const quantity = Number(body.quantity ?? 1);
+      const durationDays = Number(body.durationDays || 30);
+      if (kind !== 'membership' || !Number.isInteger(quantity) || quantity < 1 || quantity > 20 || ![30, 90].includes(durationDays)) return reply(event, { error: '请选择 30 天或 90 天会员，每批最多生成 20 个会员码。' }, 400);
+      await ensureCollection('cp_codes');
+      const codes = await db.runTransaction(async (transaction) => {
+        const issued = [];
+        for (let index = 0; index < quantity; index += 1) {
+          const code = `PAW-${crypto.randomBytes(16).toString('hex').toUpperCase().match(/.{1,4}/g).join('-')}`;
+          const saved = await transaction.collection('cp_codes').add({ codeHash: sha256(code), suffix: code.slice(-9), kind, durationDays, createdAt: now(), issuedBy: user._id });
+          issued.push({ id: saved.id || saved._id, code, kind, durationDays });
+        }
+        return issued;
       });
-      return reply(event, { code, durationDays }, 201);
+      return reply(event, { codes, code: codes[0].code }, 201);
+    }
+    if (method === 'GET' && path === '/admin/codes') {
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以查看会员码。' }, 403);
+      await ensureCollection('cp_codes');
+      const offset = Math.max(0, Math.floor(Number(query.offset) || 0));
+      const [total, result] = await Promise.all([countWhere('cp_codes'), db.collection('cp_codes').orderBy('createdAt', 'desc').skip(offset).limit(20).get()]);
+      return reply(event, { total, offset, limit: 20, codes: (result.data || []).map((code) => ({ id: code._id, label: code.suffix ? `••••-${code.suffix}` : '旧版会员码', kind: code.kind || 'membership', credits: code.credits || 0, durationDays: code.durationDays || 30, status: code.usedAt ? 'used' : code.revokedAt ? 'revoked' : 'unused', createdAt: code.createdAt, usedAt: code.usedAt || null })) });
+    }
+    const codeStatusMatch = path.match(/^\/admin\/codes\/([^/]+)$/);
+    if (method === 'PUT' && codeStatusMatch) {
+      if (!isAdmin(user)) return reply(event, { error: '只有管理员可以停用会员码。' }, 403);
+      if (body.status !== 'revoked') return reply(event, { error: '会员码状态无效。' }, 400);
+      try {
+        await db.runTransaction(async (transaction) => {
+          const ref = transaction.collection('cp_codes').doc(decodeURIComponent(codeStatusMatch[1]));
+          const result = await ref.get();
+          const code = Array.isArray(result.data) ? result.data[0] : result.data;
+          if (!code) throw Object.assign(new Error('未找到会员码。'), { status: 404 });
+          if (code.usedAt) throw Object.assign(new Error('已兑换的会员码不能停用。'), { status: 409 });
+          await ref.update({ revokedAt: now(), revokedBy: user._id });
+        });
+        return reply(event, { ok: true });
+      } catch (error) { if ([404, 409].includes(error.status)) return reply(event, { error: error.message }, error.status); throw error; }
     }
     if (method === 'POST' && path === '/pet-license') {
       if (!isAdmin(user) && (!user.vipExpiresAt || new Date(user.vipExpiresAt) <= new Date())) {
