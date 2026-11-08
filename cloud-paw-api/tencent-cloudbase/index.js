@@ -5,6 +5,7 @@ const app = tcb.init({ env: tcb.SYMBOL_CURRENT_ENV });
 const db = app.database();
 const WEB_ORIGIN = 'https://080805liang-source.github.io';
 const STATIC_ORIGIN = 'https://cloud-paw-vip-cn-d0eub7r110788a3-1460995143.tcloudbaseapp.com';
+const PUBLIC_ORIGIN = 'https://petforge-desktop.pages.dev';
 // 店主账号：固定保留，避免部署环境变量误配置导致管理员权限丢失。
 const ADMIN_EMAILS = new Set([
   '3903345807@qq.com',
@@ -24,6 +25,7 @@ const passwordHash = (password, salt) => crypto.pbkdf2Sync(String(password), sal
 const isAllowedOrigin = (origin) => origin === 'null'
   || origin === WEB_ORIGIN
   || origin === STATIC_ORIGIN
+  || origin === PUBLIC_ORIGIN
   || /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin)
   || /^https:\/\/cloud-paw-vip-cn-d0eub7r110788a3(?:-[a-z0-9]+)?(?:\.ap-shanghai)?\.(?:app\.tcloudbase\.com|tcloudbaseapp\.com)$/i.test(origin);
 const headers = (origin) => ({
