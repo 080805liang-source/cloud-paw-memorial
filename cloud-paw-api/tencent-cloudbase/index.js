@@ -21,25 +21,53 @@ const WORKSHOP = 'pf_workshop';
 const WORKSHOP_UPLOADS = 'pf_workshop_uploads';
 const random = () => crypto.randomBytes(32).toString('hex');
 const sha256 = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
-const passwordHash = (password, salt) => crypto.pbkdf2Sync(String(password), salt, 100000, 32, 'sha256').toString('hex');
-const isAllowedOrigin = (origin) => origin === 'null'
-  || origin === WEB_ORIGIN
-  || origin === STATIC_ORIGIN
-  || origin === PUBLIC_ORIGIN
-  || /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin)
-  || /^https:\/\/cloud-paw-vip-cn-d0eub7r110788a3(?:-[a-z0-9]+)?(?:\.ap-shanghai)?\.(?:app\.tcloudbase\.com|tcloudbaseapp\.com)$/i.test(origin);
+const PASSWORD_ITERATIONS = 600000;
+const passwordHash = (password, salt, iterations = PASSWORD_ITERATIONS) => new Promise((resolve, reject) => crypto.pbkdf2(password, salt, iterations, 32, 'sha256', (error, result) => error ? reject(error) : resolve(result.toString('hex'))));
+const securityError = (message, status = 400) => Object.assign(new Error(message), { status, safe: true });
+const isAllowedOrigin = (origin) => [WEB_ORIGIN, STATIC_ORIGIN, PUBLIC_ORIGIN, 'https://cloud-paw-vip-cn-d0eub7r110788a3-1460995143.ap-shanghai.app.tcloudbase.com'].includes(origin)
+  || /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/.test(origin);
 const headers = (origin) => ({
   'content-type': 'application/json; charset=utf-8',
   'access-control-allow-origin': isAllowedOrigin(origin) ? origin : WEB_ORIGIN,
   'access-control-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'access-control-allow-headers': 'content-type, authorization'
+  'access-control-allow-headers': 'content-type, authorization',
+  'cache-control': 'no-store', 'pragma': 'no-cache', 'vary': 'Origin',
+  'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY',
+  'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+  'referrer-policy': 'no-referrer'
 });
-const reply = (event, body, statusCode = 200) => ({ statusCode, headers: headers(event.headers?.origin || ''), body: JSON.stringify(body) });
+const reply = (event, body, statusCode = 200) => ({ statusCode, headers: { ...headers(event.headers?.origin || ''), ...(statusCode === 429 ? { 'retry-after': '60' } : {}) }, body: JSON.stringify(body) });
 const getOne = async (collection, where) => {
   const result = await db.collection(collection).where(where).limit(1).get();
   return result.data?.[0] || null;
 };
-const readBody = (event) => { try { return JSON.parse(event.body || '{}'); } catch (_) { return {}; } };
+const readBody = (event) => {
+  const raw = String(event.body || '{}');
+  if (event.isBase64Encoded || Buffer.byteLength(raw) > 900000) throw securityError('请求内容过大或格式不受支持。', 413);
+  let body;
+  try { body = JSON.parse(raw, (key, value) => { if (['__proto__', 'constructor', 'prototype'].includes(key)) throw new Error('unsafe key'); return value; }); }
+  catch (_) { throw securityError('请求需为有效的 JSON 对象。'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw securityError('请求需为有效的 JSON 对象。');
+  for (const key of ['email','phone','identity','password','confirmPassword','emailCode','challengeId','code']) if (body[key] !== undefined && (typeof body[key] !== 'string' || body[key].length > 256)) throw securityError('账号信息格式无效或过长。');
+  return body;
+};
+const RATE_LIMITS = 'cp_rate_limits';
+const clientAddress = (event) => String(event.requestContext?.sourceIp || event.requestContext?.http?.sourceIp || event.clientIP || 'unknown').slice(0, 80);
+async function limitRequests(scope, actor, limit, milliseconds) {
+  await ensureCollection(RATE_LIMITS);
+  const id = sha256(`${scope}:${actor}`);
+  const allowed = await db.runTransaction(async (transaction) => {
+    const result = await transaction.collection(RATE_LIMITS).doc(id).get();
+    const previous = Array.isArray(result.data) ? result.data[0] : result.data;
+    const active = previous && Date.parse(previous.expiresAt) > Date.now();
+    if (active && previous.count >= limit) return false;
+    const data = { count: active ? previous.count + 1 : 1, expiresAt: active ? previous.expiresAt : new Date(Date.now() + milliseconds).toISOString() };
+    if (previous) await transaction.collection(RATE_LIMITS).doc(id).update(data);
+    else await transaction.collection(RATE_LIMITS).add({ _id: id, ...data });
+    return true;
+  });
+  if (!allowed) throw securityError('操作过于频繁，请稍后重试。', 429);
+}
 const isAdmin = (user) => ADMIN_EMAILS.has(String(user?.email || '').trim().toLowerCase());
 const hasMembership = (user) => Boolean(user?.vipExpiresAt && new Date(user.vipExpiresAt) > new Date());
 const publicUser = (user) => ({ id: user._id, email: user.email || null, phone: user.phone || null, credits: Number(user.credits || 0), isAdmin: isAdmin(user), membershipActive: hasMembership(user), vipExpiresAt: user.vipExpiresAt || null });
@@ -106,6 +134,20 @@ function workshopImage(value, maxBytes, maxSide) {
   return `data:image/png;base64,${bytes.toString('base64')}`;
 }
 
+const SHARED_APPS = {"snssdk1128://":{"label":"打开抖音","type":"app","target":"snssdk1128://","fallback":"https://www.douyin.com/","appPaths":["%LocalAppData%\\Douyin\\Douyin.exe","%ProgramFiles%\\Douyin\\Douyin.exe"]},"bilibili://":{"label":"打开哔哩哔哩","type":"app","target":"bilibili://","fallback":"https://www.bilibili.com/","appPaths":["%LocalAppData%\\Programs\\bilibili\\bilibili.exe","%ProgramFiles%\\bilibili\\bilibili.exe"]},"tencent://":{"label":"打开 QQ","type":"app","target":"tencent://","fallback":"https://im.qq.com/","appPaths":["%ProgramFiles%\\Tencent\\QQNT\\QQ.exe","%ProgramFiles(x86)%\\Tencent\\QQNT\\QQ.exe","%ProgramFiles%\\Tencent\\QQ\\QQ.exe","%ProgramFiles(x86)%\\Tencent\\QQ\\QQ.exe","%LocalAppData%\\Tencent\\QQ\\QQ.exe"]},"weixin://":{"label":"打开微信","type":"app","target":"weixin://","fallback":"https://weixin.qq.com/","appPaths":["%ProgramFiles%\\Tencent\\WeChat\\WeChat.exe","%ProgramFiles(x86)%\\Tencent\\WeChat\\WeChat.exe","%LocalAppData%\\Tencent\\WeChat\\WeChat.exe"]},"feishu://":{"label":"打开飞书","type":"app","target":"feishu://","fallback":"https://www.feishu.cn/","appPaths":["%LocalAppData%\\Programs\\Feishu\\Feishu.exe","%LocalAppData%\\Feishu\\Feishu.exe","%ProgramFiles%\\Feishu\\Feishu.exe"]},"dingtalk://":{"label":"打开钉钉","type":"app","target":"dingtalk://","fallback":"https://www.dingtalk.com/","appPaths":["%LocalAppData%\\DingTalk\\DingTalk.exe","%ProgramFiles(x86)%\\DingDing\\DingTalk.exe","%ProgramFiles%\\DingDing\\DingTalk.exe"]},"wxwork://":{"label":"打开企业微信","type":"app","target":"wxwork://","fallback":"https://work.weixin.qq.com/","appPaths":["%ProgramFiles%\\Tencent\\WeChat\\WXWork\\WXWork.exe","%ProgramFiles(x86)%\\Tencent\\WeChat\\WXWork\\WXWork.exe"]},"wps://":{"label":"打开 WPS Office","type":"app","target":"wps://","fallback":"https://www.wps.cn/","appPaths":["%ProgramFiles%\\kingsoft\\WPS Office\\ksolaunch.exe","%ProgramFiles(x86)%\\kingsoft\\WPS Office\\ksolaunch.exe"]},"steam://open/main":{"label":"打开 Steam","type":"app","target":"steam://open/main","fallback":"https://store.steampowered.com/","appPaths":["%ProgramFiles(x86)%\\Steam\\steam.exe","%ProgramFiles%\\Steam\\steam.exe"]},"com.epicgames.launcher://apps":{"label":"打开 Epic Games","type":"app","target":"com.epicgames.launcher://apps","fallback":"https://store.epicgames.com/","appPaths":["%ProgramFiles%\\Epic Games\\Launcher\\Portal\\Binaries\\Win64\\EpicGamesLauncher.exe","%ProgramFiles(x86)%\\Epic Games\\Launcher\\Portal\\Binaries\\Win32\\EpicGamesLauncher.exe"]},"orpheus://":{"label":"打开网易云音乐","type":"app","target":"orpheus://","fallback":"https://music.163.com/","appPaths":["%ProgramFiles%\\Netease\\CloudMusic\\cloudmusic.exe","%ProgramFiles(x86)%\\Netease\\CloudMusic\\cloudmusic.exe"]},"vscode://":{"label":"打开 VS Code","type":"app","target":"vscode://","fallback":"https://code.visualstudio.com/","appPaths":["%LocalAppData%\\Programs\\Microsoft VS Code\\Code.exe","%ProgramFiles%\\Microsoft VS Code\\Code.exe"]},"discord://":{"label":"打开 Discord","type":"app","target":"discord://","fallback":"https://discord.com/app","appPaths":["%LocalAppData%\\Discord\\Update.exe"]}};
+function sharedShortcut(item) {
+  if (!item || typeof item.target !== 'string' || /[\x00-\x20\x7f]/.test(item.target)) throw securityError('公开作品的快捷入口仅支持 HTTPS 网页或内置常用软件。');
+  const label = String(item.label || '').slice(0, 80);
+  if (item.type === 'url') {
+    let url; try { url = new URL(item.target); } catch (_) { throw securityError('快捷网址无效。'); }
+    if (url.protocol !== 'https:' || url.username || url.password || item.target.length > 1024) throw securityError('公开作品的快捷网址必须使用 HTTPS。');
+    return { label, type: 'url', target: url.href };
+  }
+  const preset = item.type === 'app' && Object.hasOwn(SHARED_APPS, item.target) && SHARED_APPS[item.target];
+  if (!preset) throw securityError('公开作品的快捷入口仅支持 HTTPS 网页或内置常用软件。');
+  return { ...preset, label: label || preset.label };
+}
+
 function workshopConfig(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input) || JSON.stringify(input).length > 32000) throw Object.assign(new Error('作品配置无效或过大。'), { status: 400 });
   const result = {};
@@ -118,13 +160,7 @@ function workshopConfig(input) {
   if (!String(result.name || '').trim() || String(result.name).length > 80) throw Object.assign(new Error('请填写作品名称。'), { status: 400 });
   const shortcuts = input.customShortcuts || [];
   if (!Array.isArray(shortcuts) || shortcuts.length > 20) throw Object.assign(new Error('快捷入口最多 20 项。'), { status: 400 });
-  result.customShortcuts = shortcuts.map((item) => {
-    if (!item || !['file','folder','url','app'].includes(item.type) || typeof item.target !== 'string' || /^(?:javascript|data|vbscript):/i.test(item.target.trim())) throw Object.assign(new Error('作品包含无效的快捷入口。'), { status: 400 });
-    const clean = {};
-    for (const key of ['id','label','type','target','fallback']) if (typeof item[key] === 'string') clean[key] = item[key].slice(0, 1024);
-    if (Array.isArray(item.appPaths)) clean.appPaths = item.appPaths.filter((path) => typeof path === 'string').slice(0, 10).map((path) => path.slice(0, 1024));
-    return clean;
-  });
+  result.customShortcuts = shortcuts.map(sharedShortcut);
   if (/^animal-\d{1,12}$/.test(input.animationPreset || '')) result.animationPreset = input.animationPreset;
   if (typeof input.assetAttribution === 'string') result.assetAttribution = input.assetAttribution.slice(0,8000);
   return { ...result, image: 'pet.png', safeRendering: false, targetFps: 120 };
@@ -132,7 +168,7 @@ function workshopConfig(input) {
 
 function publicWorkshop(post, full = false) {
   return { id: post._id, authorId: post.userId, author: post.author, title: post.title, description: post.description || '', preview: post.preview, category: post.category || 'community', animated: post.animated === true, curated: post.curated === true, shortcutCount: post.config?.customShortcuts?.length || post.shortcutCount || 0, style: post.style || 'original', downloads: Number(post.downloads || 0), createdAt: post.createdAt,
-    ...(full ? { image: post.image, imageSha256: post.imageSha256, config: post.config } : {}) };
+    ...(full ? { image: post.image, imageSha256: post.imageSha256, config: { ...post.config, customShortcuts: (post.config?.customShortcuts || []).flatMap((item) => { try { return [sharedShortcut(item)]; } catch (_) { return []; } }) } } : {}) };
 }
 const plusDays = (oldExpiry, days) => {
   const base = oldExpiry && new Date(oldExpiry) > new Date() ? new Date(oldExpiry) : new Date();
@@ -140,17 +176,23 @@ const plusDays = (oldExpiry, days) => {
   return base.toISOString();
 };
 
+function bearerToken(event) {
+  return /^Bearer ([a-zA-Z0-9_-]{1,256})$/.exec(String(event.headers?.authorization || ''))?.[1] || '';
+}
+async function findSession(token) {
+  return token ? await getOne('cp_sessions', { tokenHash: sha256(token) }) || await getOne('cp_sessions', { token }) : null;
+}
 async function sessionUser(event) {
-  const token = String(event.headers?.authorization || '').replace(/^Bearer\s+/i, '');
-  if (!token) return null;
-  const session = await getOne('cp_sessions', { token });
-  if (!session || new Date(session.expiresAt) <= new Date()) return null;
+  const token = bearerToken(event);
+  const session = await findSession(token);
+  if (!session || !Number.isFinite(Date.parse(session.expiresAt)) || Date.parse(session.expiresAt) <= Date.now()) return null;
+  if (!session.tokenHash) await db.collection('cp_sessions').doc(session._id).update({ tokenHash: sha256(token), token: '' });
   return getOne('cp_users', { _id: session.userId });
 }
 async function createSession(userId) {
   const token = random();
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  await db.collection('cp_sessions').add({ userId, token, expiresAt, createdAt: now() });
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  await db.collection('cp_sessions').add({ userId, tokenHash: sha256(token), expiresAt, createdAt: now() });
   return token;
 }
 const EMAIL_CODES = 'cp_email_codes';
@@ -218,17 +260,20 @@ async function verifyEmailCode(email, code, challengeId) {
 }
 
 exports.main = async (event) => {
+  event = { ...event, headers: Object.fromEntries(Object.entries(event.headers || {}).map(([key, value]) => [key.toLowerCase(), value])) };
   const method = String(event.httpMethod || 'GET').toUpperCase();
   const parsedUrl = new URL(String(event.path || '/'), 'https://petforge.invalid');
   const path = parsedUrl.pathname.replace(/^\/api(?=\/|$)/, '') || '/';
   const query = event.queryStringParameters || Object.fromEntries(parsedUrl.searchParams);
-  if (method === 'OPTIONS') return { statusCode: 204, headers: headers(event.headers?.origin || ''), body: '' };
+  if (method === 'OPTIONS') return { statusCode: event.headers.origin && !isAllowedOrigin(event.headers.origin) ? 403 : 204, headers: headers(event.headers?.origin || ''), body: '' };
   const origin = event.headers?.origin || '';
   if (origin && !isAllowedOrigin(origin)) return reply(event, { error: '来源不被允许。' }, 403);
   try {
     if (path === '/health') return reply(event, { ok: true, region: 'cn', release: 'workshop-20261107' });
     if (method === 'POST' && ['/orders', '/admin/confirm-order'].includes(path)) return reply(event, { error: '站内支付已关闭，请登录后兑换会员码。' }, 410);
+    if (!['GET','POST','PUT','DELETE'].includes(method)) return reply(event, { error: '请求方法不受支持。' }, 405);
     const body = readBody(event);
+    if (method !== 'GET') await limitRequests('write-ip', clientAddress(event), 1500, 60000);
     if (method === 'GET' && path === '/workshop') {
       await ensureCollection(WORKSHOP);
       const offset = Math.max(0, Math.floor(Number(query.offset) || 0));
@@ -254,6 +299,9 @@ exports.main = async (event) => {
       const email = String(body.email || '').trim().toLowerCase();
       if (!emailPattern.test(email)) return reply(event, { error: '邮箱格式不正确。' }, 400);
       if (await getOne('cp_users', { email })) return reply(event, { error: '这个邮箱已经注册，请直接登录。' }, 409);
+      await limitRequests('email-ip', clientAddress(event), 30, 3600000);
+      await limitRequests('email-global', 'all', 200, 3600000);
+      await limitRequests('email-address', email, 5, 3600000);
       return reply(event, await startEmailVerification(email));
     }
     if (method === 'POST' && path === '/auth/signup') {
@@ -263,6 +311,7 @@ exports.main = async (event) => {
       if (!emailPattern.test(email)) return reply(event, { error: '请填写有效邮箱。' }, 400);
       if (password.length < 8 || password !== String(body.confirmPassword || '')) return reply(event, { error: '密码至少 8 位，且两次输入必须一致。' }, 400);
       if (await getOne('cp_users', { email })) return reply(event, { error: '这个邮箱已经注册，请直接登录。' }, 409);
+      await limitRequests('signup-ip', clientAddress(event), 30, 3600000);
       const verification = await verifyEmailCode(email, String(body.emailCode || '').trim(), String(body.challengeId || ''));
       const salt = random();
       const user = await db.runTransaction(async (transaction) => {
@@ -271,7 +320,7 @@ exports.main = async (event) => {
         if (!current || current.challengeId !== verification.challengeId || current.usedAt || new Date(current.expiresAt) <= new Date()) throw emailError('邮箱验证码错误或已过期。');
         const existing = await transaction.collection('cp_users').where({ email }).limit(1).get();
         if (existing.data?.length) throw emailError('这个邮箱已经注册，请直接登录。', 409);
-        const record = { email, phone: null, emailVerifiedAt: now(), phoneVerifiedAt: null, passwordHash: passwordHash(password, salt), passwordSalt: salt, credits: 0, createdAt: now() };
+        const record = { email, phone: null, emailVerifiedAt: now(), phoneVerifiedAt: null, passwordHash: await passwordHash(password, salt), passwordSalt: salt, passwordIterations: PASSWORD_ITERATIONS, credits: 0, createdAt: now() };
         const added = await transaction.collection('cp_users').add(record);
         await transaction.collection(EMAIL_CODES).doc(verification._id).update({ usedAt: now() });
         return { _id: added.id || added._id, ...record };
@@ -282,24 +331,39 @@ exports.main = async (event) => {
       const identity = String(body.identity || 'email');
       const email = String(body.email || '').trim().toLowerCase();
       const phone = String(body.phone || '').trim();
+      if (!['email','phone'].includes(identity) || (identity === 'email' ? !emailPattern.test(email) : !/^1\d{10}$/.test(phone)) || typeof body.password !== 'string' || !body.password.length) return reply(event, { error: '账号或密码不正确。' }, 401);
+      await limitRequests('login-ip', clientAddress(event), 120, 15 * 60000);
+      await limitRequests('login-account', identity === 'phone' ? phone : email, 8, 15 * 60000);
       const user = await getOne('cp_users', identity === 'phone' ? { phone } : { email });
-      if (!user || passwordHash(body.password || '', user.passwordSalt) !== user.passwordHash) return reply(event, { error: '账号或密码不正确。' }, 401);
+      const iterations = user?.passwordIterations === PASSWORD_ITERATIONS ? PASSWORD_ITERATIONS : 100000;
+      const actual = await passwordHash(body.password, user?.passwordSalt || 'petforge-unknown-account', iterations);
+      const expected = /^[a-f0-9]{64}$/.test(user?.passwordHash || '') ? user.passwordHash : '0'.repeat(64);
+      if (!user || !crypto.timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex'))) return reply(event, { error: '账号或密码不正确。' }, 401);
+      if (iterations < PASSWORD_ITERATIONS) {
+        const salt = random();
+        await db.collection('cp_users').doc(user._id).update({ passwordHash: await passwordHash(body.password, salt), passwordSalt: salt, passwordIterations: PASSWORD_ITERATIONS });
+      }
       return reply(event, { token: await createSession(user._id), user: publicUser(user) });
     }
     if (method === 'POST' && path === '/analytics/pageview') {
       const page = String(body.page || '');
       if (!['home', 'creator', 'workshop', 'support'].includes(page)) return reply(event, { error: '页面参数无效。' }, 400);
       await ensureCollection(ADMIN_EVENTS);
+      await limitRequests('analytics-ip', clientAddress(event), 60, 60000);
       await db.collection(ADMIN_EVENTS).add({ type: 'page_view', page, day: shanghaiDay(), createdAt: now() });
       return reply(event, { ok: true }, 202);
     }
     if (method === 'POST' && path === '/auth/logout') {
-      const token = String(event.headers?.authorization || '').replace(/^Bearer\s+/i, '');
-      if (token) { const old = await getOne('cp_sessions', { token }); if (old) await db.collection('cp_sessions').doc(old._id).remove(); }
+      const token = bearerToken(event);
+      if (token) { const old = await findSession(token); if (old) await db.collection('cp_sessions').doc(old._id).remove(); }
       return reply(event, { ok: true });
     }
     const user = await sessionUser(event);
     if (!user) return reply(event, { error: '请先登录。' }, 401);
+    if (method !== 'GET') {
+      const limits = path === '/workshop/upload' ? [120, 60000] : path === '/workshop' ? [10, 3600000] : path === '/feedback' ? [5, 3600000] : path === '/redeem' ? [10, 15 * 60000] : [60, 60000];
+      await limitRequests(`user:${path.startsWith('/admin/') ? 'admin' : path}`, user._id, ...limits);
+    }
     if (method === 'POST' && path === '/workshop/upload') {
       const { uploadId, index, total, data } = body;
       if (!/^[a-f0-9]{32}$/.test(String(uploadId)) || !Number.isInteger(index) || !Number.isInteger(total) || total < 1 || total > 40 || index < 0 || index >= total || typeof data !== 'string' || !data.length || data.length > 24000) return reply(event, { error: '上传分片参数无效。' }, 400);
@@ -528,8 +592,8 @@ exports.main = async (event) => {
     }
     return reply(event, { error: '接口不存在。' }, 404);
   } catch (error) {
-    if (error.status === 400 || error.emailVerification) return reply(event, { error: error.message }, error.status);
-    console.error(error);
+    if (error.status === 400 || error.emailVerification || error.safe) return reply(event, { error: error.message }, error.status);
+    console.error('API request failed', { path, code: String(error.code || 'INTERNAL').slice(0, 80) });
     return reply(event, { error: '会员服务暂时繁忙，请稍后再试。' }, 500);
   }
 };
