@@ -153,79 +153,68 @@ async function createSession(userId) {
   await db.collection('cp_sessions').add({ userId, token, expiresAt, createdAt: now() });
   return token;
 }
-const phonePattern = /^1\d{10}$/;
-const smsConfigReady = () => Boolean(process.env.TENCENTCLOUD_SECRET_ID && process.env.TENCENTCLOUD_SECRET_KEY && process.env.SMS_SDK_APP_ID && process.env.SMS_SIGN_NAME && process.env.SMS_TEMPLATE_ID);
-const emailConfigReady = () => Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM);
-function tencentSmsSignature(payload, timestamp) {
-  const host = 'sms.tencentcloudapi.com';
-  const service = 'sms';
-  const date = new Date(timestamp * 1000).toISOString().slice(0, 10);
-  const hashedPayload = crypto.createHash('sha256').update(payload).digest('hex');
-  const canonical = `content-type:application/json; charset=utf-8\nhost:${host}\n`;
-  const signedHeaders = 'content-type;host';
-  const canonicalRequest = `POST\n/\n\n${canonical}\n${signedHeaders}\n${hashedPayload}`;
-  const credentialScope = `${date}/${service}/tc3_request`;
-  const secretDate = crypto.createHmac('sha256', `TC3${process.env.TENCENTCLOUD_SECRET_KEY}`).update(date).digest();
-  const secretService = crypto.createHmac('sha256', secretDate).update(service).digest();
-  const secretSigning = crypto.createHmac('sha256', secretService).update('tc3_request').digest();
-  const stringToSign = `TC3-HMAC-SHA256\n${timestamp}\n${credentialScope}\n${crypto.createHash('sha256').update(canonicalRequest).digest('hex')}`;
-  const signature = crypto.createHmac('sha256', secretSigning).update(stringToSign).digest('hex');
-  return `TC3-HMAC-SHA256 Credential=${process.env.TENCENTCLOUD_SECRET_ID}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-}
-function sendSmsCode(phone, code) {
-  if (!smsConfigReady()) throw new Error('短信服务尚未配置，请先完成腾讯云短信配置。');
+const EMAIL_CODES = 'cp_email_codes';
+const emailPattern = /^[.0-9a-z_-]{1,40}@[.0-9a-z_-]{1,40}\.[a-z]{1,10}$/i;
+const emailError = (message, status = 400) => Object.assign(new Error(message), { status, emailVerification: true });
+function emailProvider(path, body) {
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({
-      PhoneNumberSet: [`+86${phone}`],
-      SmsSdkAppId: process.env.SMS_SDK_APP_ID,
-      SignName: process.env.SMS_SIGN_NAME,
-      TemplateId: process.env.SMS_TEMPLATE_ID,
-      TemplateParamSet: [code, '10']
-    });
-    const timestamp = Math.floor(Date.now() / 1000);
-    const request = https.request({ hostname: 'sms.tencentcloudapi.com', path: '/', method: 'POST', headers: {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Content-Length': Buffer.byteLength(payload),
-      'X-TC-Action': 'SendSms', 'X-TC-Version': '2021-01-11', 'X-TC-Region': process.env.SMS_REGION || 'ap-guangzhou',
-      'X-TC-Timestamp': String(timestamp), 'X-TC-Language': 'zh-CN', Authorization: tencentSmsSignature(payload, timestamp)
-    }}, (response) => {
+    const payload = JSON.stringify(body);
+    const request = https.request({
+      hostname: 'cloud-paw-vip-cn-d0eub7r110788a3.api.tcloudbasegateway.com',
+      path: `/auth/v1/verification${path}`, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+    }, (response) => {
       let data = '';
       response.on('data', (chunk) => { data += chunk; });
-      response.on('end', () => { try { const result = JSON.parse(data); if (result.Response?.Error) reject(new Error(result.Response.Error.Message)); else resolve(); } catch (_) { reject(new Error('短信服务返回无效响应。')); } });
+      response.on('error', () => reject(emailError('邮箱验证服务连接中断，请稍后重试。', 502)));
+      response.on('end', () => {
+        let result;
+        try { result = JSON.parse(data); }
+        catch (_) { reject(emailError('邮箱验证服务返回异常，请稍后重试。', 502)); return; }
+        if (response.statusCode >= 200 && response.statusCode < 300) { resolve(result); return; }
+        const reason = String(result.error || result.code || '').toLowerCase();
+        if (/captcha/.test(reason)) reject(emailError('邮箱服务需要额外安全验证，请稍后重试或联系网站管理员。', 503));
+        else if (response.statusCode === 429 || /rate|frequent|limit/.test(reason)) reject(emailError('验证码请求过于频繁，请稍后重试。', 429));
+        else if (path && /invalid|expired|verification/.test(reason)) reject(emailError('邮箱验证码错误或已过期。'));
+        else reject(emailError('邮箱验证服务暂时不可用，请稍后重试。', 502));
+      });
     });
-    request.on('error', reject); request.write(payload); request.end();
+    request.setTimeout(8000, () => request.destroy(new Error('timeout')));
+    request.on('error', () => reject(emailError('邮箱验证服务连接超时，请稍后重试。', 502)));
+    request.end(payload);
   });
 }
-function sendEmailCode(email, code) {
-  if (!emailConfigReady()) throw new Error('邮箱验证码服务尚未配置，请先联系管理员。');
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({
-      from: process.env.EMAIL_FROM,
-      to: [email],
-      subject: 'PET FORGE 邮箱验证码',
-      html: `<p>你的 PET FORGE 注册验证码是：</p><p style="font-size:28px;font-weight:700;letter-spacing:8px">${code}</p><p>验证码 10 分钟内有效。如非本人操作，请忽略此邮件。</p>`
-    });
-    const request = https.request({ hostname: 'api.resend.com', path: '/emails', method: 'POST', headers: {
-      'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${process.env.RESEND_API_KEY}`
-    }}, (response) => {
-      let data = '';
-      response.on('data', (chunk) => { data += chunk; });
-      response.on('end', () => { if (response.statusCode >= 200 && response.statusCode < 300) resolve(); else { try { reject(new Error(JSON.parse(data).message || '邮件服务返回错误。')); } catch (_) { reject(new Error('邮件服务返回错误。')); } } });
-    });
-    request.on('error', reject); request.write(payload); request.end();
+async function startEmailVerification(email) {
+  await ensureCollection(EMAIL_CODES);
+  const id = sha256(email);
+  const challengeId = random();
+  await db.runTransaction(async (transaction) => {
+    const result = await transaction.collection(EMAIL_CODES).doc(id).get();
+    const previous = Array.isArray(result.data) ? result.data[0] : result.data;
+    if (previous && Date.now() - new Date(previous.sentAt).getTime() < 60000) throw emailError('请等待 60 秒后再发送验证码。', 429);
+    const record = { email, challengeId, verificationId: '', attempts: 0, usedAt: null, sentAt: now(), expiresAt: now() };
+    if (previous) await transaction.collection(EMAIL_CODES).doc(id).update(record);
+    else await transaction.collection(EMAIL_CODES).add({ _id: id, ...record });
   });
+  const result = await emailProvider('', { email, target: 'ANY' });
+  if (!result.verification_id || !Number.isFinite(result.expires_in) || result.expires_in <= 0) throw emailError('邮箱验证服务返回异常，请稍后重试。', 502);
+  const expiresIn = Math.min(600, result.expires_in);
+  await db.collection(EMAIL_CODES).doc(id).update({ verificationId: result.verification_id, expiresAt: new Date(Date.now() + expiresIn * 1000).toISOString() });
+  return { ok: true, challengeId, expiresIn, retryAfter: 60 };
 }
-async function verifySmsCode(phone, code) {
-  const record = await getOne('cp_sms_codes', { phone, codeHash: sha256(code) });
-  if (!record || record.usedAt || new Date(record.expiresAt) <= new Date()) return false;
-  await db.collection('cp_sms_codes').doc(record._id).update({ usedAt: now() });
-  return true;
-}
-async function verifyEmailCode(email, code) {
-  const record = await getOne('cp_email_codes', { email, codeHash: sha256(code) });
-  if (!record || record.usedAt || new Date(record.expiresAt) <= new Date()) return false;
-  await db.collection('cp_email_codes').doc(record._id).update({ usedAt: now() });
-  return true;
+async function verifyEmailCode(email, code, challengeId) {
+  if (!/^\d{6}$/.test(code) || !/^[a-f0-9]{64}$/.test(challengeId)) throw emailError('请先获取邮箱验证码，并输入收到的 6 位验证码。');
+  const record = await db.runTransaction(async (transaction) => {
+    const result = await transaction.collection(EMAIL_CODES).doc(sha256(email)).get();
+    const current = Array.isArray(result.data) ? result.data[0] : result.data;
+    if (!current || current.challengeId !== challengeId || !current.verificationId || current.usedAt || new Date(current.expiresAt) <= new Date()) throw emailError('邮箱验证码错误或已过期。');
+    if (current.attempts >= 5) throw emailError('验证码尝试次数过多，请重新获取。', 429);
+    await transaction.collection(EMAIL_CODES).doc(current._id).update({ attempts: db.command.inc(1) });
+    return { ...current };
+  });
+  const result = await emailProvider('/verify', { verification_id: record.verificationId, verification_code: code });
+  if (!result.verification_token) throw emailError('邮箱验证服务返回异常，请稍后重试。', 502);
+  return record;
 }
 
 exports.main = async (event) => {
@@ -260,42 +249,33 @@ exports.main = async (event) => {
       const post = await getOne(WORKSHOP, { _id: workshopMatch[1], isPublic: true });
       return post ? reply(event, { post: publicWorkshop(post, true) }) : reply(event, { error: '这个作品不存在或已取消分享。' }, 404);
     }
-    if (method === 'POST' && path === '/auth/send-code') {
-      const phone = String(body.phone || '').trim();
-      if (!phonePattern.test(phone)) return reply(event, { error: '手机号格式不正确。' }, 400);
-      if (!smsConfigReady()) return reply(event, { error: '短信验证码服务尚未配置，请先联系管理员。' }, 503);
-      const code = String(crypto.randomInt(100000, 1000000));
-      try { await sendSmsCode(phone, code); } catch (error) { return reply(event, { error: `验证码发送失败：${error.message}` }, 502); }
-      await db.collection('cp_sms_codes').add({ phone, codeHash: sha256(code), expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(), createdAt: now() });
-      return reply(event, { ok: true });
-    }
+    if (method === 'POST' && path === '/auth/send-code') return reply(event, { error: '手机号注册暂未开放，请使用邮箱注册；已有手机号账号可使用密码登录。' }, 503);
     if (method === 'POST' && path === '/auth/send-email-code') {
       const email = String(body.email || '').trim().toLowerCase();
-      if (!/^\S+@\S+\.\S+$/.test(email)) return reply(event, { error: '邮箱格式不正确。' }, 400);
-      if (!emailConfigReady()) return reply(event, { error: '邮箱验证码服务尚未配置，请先联系管理员。' }, 503);
-      const code = String(crypto.randomInt(100000, 1000000));
-      try { await sendEmailCode(email, code); } catch (error) { return reply(event, { error: `验证码发送失败：${error.message}` }, 502); }
-      await db.collection('cp_email_codes').add({ email, codeHash: sha256(code), expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(), createdAt: now() });
-      return reply(event, { ok: true });
+      if (!emailPattern.test(email)) return reply(event, { error: '邮箱格式不正确。' }, 400);
+      if (await getOne('cp_users', { email })) return reply(event, { error: '这个邮箱已经注册，请直接登录。' }, 409);
+      return reply(event, await startEmailVerification(email));
     }
     if (method === 'POST' && path === '/auth/signup') {
-      const identity = String(body.identity || 'email');
+      if (body.identity && body.identity !== 'email') return reply(event, { error: '手机号注册暂未开放，请使用邮箱注册；已有手机号账号可使用密码登录。' }, 503);
       const email = String(body.email || '').trim().toLowerCase();
-      const phone = String(body.phone || '').trim();
       const password = String(body.password || '');
+      if (!emailPattern.test(email)) return reply(event, { error: '请填写有效邮箱。' }, 400);
       if (password.length < 8 || password !== String(body.confirmPassword || '')) return reply(event, { error: '密码至少 8 位，且两次输入必须一致。' }, 400);
-      if (identity === 'phone') {
-        if (!phonePattern.test(phone)) return reply(event, { error: '请输入有效手机号。' }, 400);
-        if (await getOne('cp_users', { phone })) return reply(event, { error: '这个手机号已经注册，请直接登录。' }, 409);
-        if (!await verifySmsCode(phone, String(body.smsCode || '').trim())) return reply(event, { error: '验证码错误或已过期。' }, 400);
-      } else {
-        if (!/^\S+@\S+\.\S+$/.test(email)) return reply(event, { error: '请填写有效邮箱。' }, 400);
-        if (await getOne('cp_users', { email })) return reply(event, { error: '这个邮箱已经注册，请直接登录。' }, 409);
-        if (!await verifyEmailCode(email, String(body.emailCode || '').trim())) return reply(event, { error: '邮箱验证码错误或已过期。' }, 400);
-      }
+      if (await getOne('cp_users', { email })) return reply(event, { error: '这个邮箱已经注册，请直接登录。' }, 409);
+      const verification = await verifyEmailCode(email, String(body.emailCode || '').trim(), String(body.challengeId || ''));
       const salt = random();
-      const added = await db.collection('cp_users').add({ email: identity === 'email' ? email : null, phone: identity === 'phone' ? phone : null, emailVerifiedAt: identity === 'email' ? now() : null, phoneVerifiedAt: identity === 'phone' ? now() : null, passwordHash: passwordHash(password, salt), passwordSalt: salt, credits: 0, createdAt: now() });
-      const user = { _id: added.id || added._id, email, phone, credits: 0 };
+      const user = await db.runTransaction(async (transaction) => {
+        const result = await transaction.collection(EMAIL_CODES).doc(verification._id).get();
+        const current = Array.isArray(result.data) ? result.data[0] : result.data;
+        if (!current || current.challengeId !== verification.challengeId || current.usedAt || new Date(current.expiresAt) <= new Date()) throw emailError('邮箱验证码错误或已过期。');
+        const existing = await transaction.collection('cp_users').where({ email }).limit(1).get();
+        if (existing.data?.length) throw emailError('这个邮箱已经注册，请直接登录。', 409);
+        const record = { email, phone: null, emailVerifiedAt: now(), phoneVerifiedAt: null, passwordHash: passwordHash(password, salt), passwordSalt: salt, credits: 0, createdAt: now() };
+        const added = await transaction.collection('cp_users').add(record);
+        await transaction.collection(EMAIL_CODES).doc(verification._id).update({ usedAt: now() });
+        return { _id: added.id || added._id, ...record };
+      });
       return reply(event, { token: await createSession(user._id), user: publicUser(user) }, 201);
     }
     if (method === 'POST' && path === '/auth/login') {
@@ -457,7 +437,7 @@ exports.main = async (event) => {
           return { ...owner, ...changes };
         });
         return reply(event, { user: publicUser(updated), credits: Number(updated.credits || 0), vipExpiresAt: updated.vipExpiresAt || null });
-      } catch (error) { if (error.status === 400) return reply(event, { error: error.message }, 400); throw error; }
+      } catch (error) { if (error.status === 400 || error.emailVerification) return reply(event, { error: error.message }, error.status); throw error; }
     }
     if (method === 'POST' && path === '/admin/issue-code') {
       if (!isAdmin(user)) return reply(event, { error: '只有管理员可以生成会员码。' }, 403);
@@ -548,7 +528,7 @@ exports.main = async (event) => {
     }
     return reply(event, { error: '接口不存在。' }, 404);
   } catch (error) {
-    if (error.status === 400) return reply(event, { error: error.message }, 400);
+    if (error.status === 400 || error.emailVerification) return reply(event, { error: error.message }, error.status);
     console.error(error);
     return reply(event, { error: '会员服务暂时繁忙，请稍后再试。' }, 500);
   }
