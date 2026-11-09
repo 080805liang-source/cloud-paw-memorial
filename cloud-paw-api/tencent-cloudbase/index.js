@@ -187,12 +187,18 @@ async function sessionUser(event) {
   const session = await findSession(token);
   if (!session || !Number.isFinite(Date.parse(session.expiresAt)) || Date.parse(session.expiresAt) <= Date.now()) return null;
   if (!session.tokenHash) await db.collection('cp_sessions').doc(session._id).update({ tokenHash: sha256(token), token: '' });
-  return getOne('cp_users', { _id: session.userId });
+  const user = await getOne('cp_users', { _id: session.userId });
+  return user && (session.authVersion || '') === (user.authVersion || '') ? user : null;
 }
-async function createSession(userId) {
+async function createSession(userId, expectedHash) {
   const token = random();
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-  await db.collection('cp_sessions').add({ userId, tokenHash: sha256(token), expiresAt, createdAt: now() });
+  await db.runTransaction(async transaction => {
+    const result = await transaction.collection('cp_users').doc(userId).get();
+    const user = Array.isArray(result.data) ? result.data[0] : result.data;
+    if (!user || user.passwordHash !== expectedHash) throw securityError('密码已更新，请重新登录。', 401);
+    await transaction.collection('cp_sessions').add({ userId, authVersion: user.authVersion || '', tokenHash: sha256(token), expiresAt, createdAt: now() });
+  });
   return token;
 }
 const EMAIL_CODES = 'cp_email_codes';
@@ -226,7 +232,7 @@ function emailProvider(path, body) {
     request.end(payload);
   });
 }
-async function startEmailVerification(email) {
+async function startEmailVerification(email, purpose = 'signup') {
   await ensureCollection(EMAIL_CODES);
   const id = sha256(email);
   const challengeId = random();
@@ -234,7 +240,7 @@ async function startEmailVerification(email) {
     const result = await transaction.collection(EMAIL_CODES).doc(id).get();
     const previous = Array.isArray(result.data) ? result.data[0] : result.data;
     if (previous && Date.now() - new Date(previous.sentAt).getTime() < 60000) throw emailError('请等待 60 秒后再发送验证码。', 429);
-    const record = { email, challengeId, verificationId: '', attempts: 0, usedAt: null, sentAt: now(), expiresAt: now() };
+    const record = { email, purpose, challengeId, verificationId: '', attempts: 0, usedAt: null, sentAt: now(), expiresAt: now() };
     if (previous) await transaction.collection(EMAIL_CODES).doc(id).update(record);
     else await transaction.collection(EMAIL_CODES).add({ _id: id, ...record });
   });
@@ -244,12 +250,12 @@ async function startEmailVerification(email) {
   await db.collection(EMAIL_CODES).doc(id).update({ verificationId: result.verification_id, expiresAt: new Date(Date.now() + expiresIn * 1000).toISOString() });
   return { ok: true, challengeId, expiresIn, retryAfter: 60 };
 }
-async function verifyEmailCode(email, code, challengeId) {
+async function verifyEmailCode(email, code, challengeId, purpose = 'signup') {
   if (!/^\d{6}$/.test(code) || !/^[a-f0-9]{64}$/.test(challengeId)) throw emailError('请先获取邮箱验证码，并输入收到的 6 位验证码。');
   const record = await db.runTransaction(async (transaction) => {
     const result = await transaction.collection(EMAIL_CODES).doc(sha256(email)).get();
     const current = Array.isArray(result.data) ? result.data[0] : result.data;
-    if (!current || current.challengeId !== challengeId || !current.verificationId || current.usedAt || new Date(current.expiresAt) <= new Date()) throw emailError('邮箱验证码错误或已过期。');
+    if (!current || (current.purpose || 'signup') !== purpose || current.challengeId !== challengeId || !current.verificationId || current.usedAt || !Number.isFinite(Date.parse(current.expiresAt)) || Date.parse(current.expiresAt) <= Date.now()) throw emailError('邮箱验证码错误或已过期。');
     if (current.attempts >= 5) throw emailError('验证码尝试次数过多，请重新获取。', 429);
     await transaction.collection(EMAIL_CODES).doc(current._id).update({ attempts: db.command.inc(1) });
     return { ...current };
@@ -295,6 +301,33 @@ exports.main = async (event) => {
       return post ? reply(event, { post: publicWorkshop(post, true) }) : reply(event, { error: '这个作品不存在或已取消分享。' }, 404);
     }
     if (method === 'POST' && path === '/auth/send-code') return reply(event, { error: '手机号注册暂未开放，请使用邮箱注册；已有手机号账号可使用密码登录。' }, 503);
+    if (method === 'POST' && path === '/auth/send-reset-code') {
+      const email = String(body.email || '').trim().toLowerCase();
+      if (!emailPattern.test(email)) return reply(event, { error: '邮箱格式不正确。' }, 400);
+      await limitRequests('email-ip', clientAddress(event), 30, 3600000);
+      await limitRequests('email-global', 'all', 200, 3600000);
+      await limitRequests('email-address', email, 5, 3600000);
+      return reply(event, await startEmailVerification(email, 'reset'));
+    }
+    if (method === 'POST' && path === '/auth/reset-password') {
+      const email = String(body.email || '').trim().toLowerCase();
+      const password = String(body.password || '');
+      if (!emailPattern.test(email)) return reply(event, { error: '请填写有效邮箱。' }, 400);
+      if (password.length < 8 || password !== body.confirmPassword) return reply(event, { error: '密码至少 8 位，且两次输入必须一致。' }, 400);
+      await limitRequests('reset-ip', clientAddress(event), 30, 3600000);
+      const verification = await verifyEmailCode(email, String(body.emailCode || '').trim(), String(body.challengeId || ''), 'reset');
+      const salt = random(), hash = await passwordHash(password, salt);
+      await db.runTransaction(async transaction => {
+        const result = await transaction.collection(EMAIL_CODES).doc(verification._id).get();
+        const current = Array.isArray(result.data) ? result.data[0] : result.data;
+        if (!current || current.purpose !== 'reset' || current.challengeId !== verification.challengeId || current.usedAt || !Number.isFinite(Date.parse(current.expiresAt)) || Date.parse(current.expiresAt) <= Date.now()) throw emailError('邮箱验证码错误或已过期。');
+        const users = await transaction.collection('cp_users').where({ email }).limit(1).get();
+        if (!users.data?.[0]) throw emailError('无法重置，请确认使用注册邮箱。');
+        await transaction.collection('cp_users').doc(users.data[0]._id).update({ passwordHash: hash, passwordSalt: salt, passwordIterations: PASSWORD_ITERATIONS, authVersion: random(), passwordChangedAt: now(), emailVerifiedAt: now() });
+        await transaction.collection(EMAIL_CODES).doc(current._id).update({ usedAt: now() });
+      });
+      return reply(event, { ok: true });
+    }
     if (method === 'POST' && path === '/auth/send-email-code') {
       const email = String(body.email || '').trim().toLowerCase();
       if (!emailPattern.test(email)) return reply(event, { error: '邮箱格式不正确。' }, 400);
@@ -317,7 +350,7 @@ exports.main = async (event) => {
       const user = await db.runTransaction(async (transaction) => {
         const result = await transaction.collection(EMAIL_CODES).doc(verification._id).get();
         const current = Array.isArray(result.data) ? result.data[0] : result.data;
-        if (!current || current.challengeId !== verification.challengeId || current.usedAt || new Date(current.expiresAt) <= new Date()) throw emailError('邮箱验证码错误或已过期。');
+        if (!current || current.challengeId !== verification.challengeId || current.usedAt || !Number.isFinite(Date.parse(current.expiresAt)) || Date.parse(current.expiresAt) <= Date.now()) throw emailError('邮箱验证码错误或已过期。');
         const existing = await transaction.collection('cp_users').where({ email }).limit(1).get();
         if (existing.data?.length) throw emailError('这个邮箱已经注册，请直接登录。', 409);
         const record = { email, phone: null, emailVerifiedAt: now(), phoneVerifiedAt: null, passwordHash: await passwordHash(password, salt), passwordSalt: salt, passwordIterations: PASSWORD_ITERATIONS, credits: 0, createdAt: now() };
@@ -325,7 +358,7 @@ exports.main = async (event) => {
         await transaction.collection(EMAIL_CODES).doc(verification._id).update({ usedAt: now() });
         return { _id: added.id || added._id, ...record };
       });
-      return reply(event, { token: await createSession(user._id), user: publicUser(user) }, 201);
+      return reply(event, { token: await createSession(user._id, user.passwordHash), user: publicUser(user) }, 201);
     }
     if (method === 'POST' && path === '/auth/login') {
       const identity = String(body.identity || 'email');
@@ -341,9 +374,16 @@ exports.main = async (event) => {
       if (!user || !crypto.timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex'))) return reply(event, { error: '账号或密码不正确。' }, 401);
       if (iterations < PASSWORD_ITERATIONS) {
         const salt = random();
-        await db.collection('cp_users').doc(user._id).update({ passwordHash: await passwordHash(body.password, salt), passwordSalt: salt, passwordIterations: PASSWORD_ITERATIONS });
+        const hash = await passwordHash(body.password, salt);
+        await db.runTransaction(async transaction => {
+          const result = await transaction.collection('cp_users').doc(user._id).get();
+          const current = Array.isArray(result.data) ? result.data[0] : result.data;
+          if (!current || current.passwordHash !== user.passwordHash) throw securityError('密码已更新，请重新登录。', 401);
+          await transaction.collection('cp_users').doc(user._id).update({ passwordHash: hash, passwordSalt: salt, passwordIterations: PASSWORD_ITERATIONS });
+        });
+        user.passwordHash = hash;
       }
-      return reply(event, { token: await createSession(user._id), user: publicUser(user) });
+      return reply(event, { token: await createSession(user._id, user.passwordHash), user: publicUser(user) });
     }
     if (method === 'POST' && path === '/analytics/pageview') {
       const page = String(body.page || '');
