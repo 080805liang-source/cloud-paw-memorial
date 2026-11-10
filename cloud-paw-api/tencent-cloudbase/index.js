@@ -150,7 +150,7 @@ function sharedShortcut(item) {
 
 function sharedChat(input) {
   const appearance=input?.appearance || {};
-  const result={theme:/^(glass|desktop|pixel|comic|paper|retro|outline|stitch|frame|candy)-[1-5]$/.test(appearance.theme)?appearance.theme:'glass-1',title:String(appearance.title||'和桌宠聊聊').slice(0,32),width:Math.max(300,Math.min(560,Number(appearance.width)||380)),fontSize:Math.max(12,Math.min(20,Number(appearance.fontSize)||14))};
+  const result={theme:/^(?:(?:glass|desktop|pixel|comic|paper|retro|outline|stitch|frame|candy)-[1-5]|dress-(?:0[1-9]|1[0-5])-(?:0[1-9]|10))$/.test(appearance.theme)?appearance.theme:'glass-1',title:String(appearance.title||'和桌宠聊聊').slice(0,32),width:Math.max(300,Math.min(560,Number(appearance.width)||380)),fontSize:Math.max(12,Math.min(20,Number(appearance.fontSize)||14))};
   for(const field of ['accent','background']) if(/^#[0-9a-f]{6}$/i.test(appearance[field]||''))result[field]=appearance[field];
   // Public templates carry appearance only. Never inherit another author's credentials or endpoint.
   return {mode:'basic',appearance:result};
