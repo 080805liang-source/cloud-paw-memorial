@@ -148,6 +148,14 @@ function sharedShortcut(item) {
   return { ...preset, label: label || preset.label };
 }
 
+function sharedChat(input) {
+  const appearance=input?.appearance || {};
+  const result={theme:/^(glass|desktop|pixel|comic|paper|retro|outline|stitch|frame|candy)-[1-5]$/.test(appearance.theme)?appearance.theme:'glass-1',title:String(appearance.title||'和桌宠聊聊').slice(0,32),width:Math.max(300,Math.min(560,Number(appearance.width)||380)),fontSize:Math.max(12,Math.min(20,Number(appearance.fontSize)||14))};
+  for(const field of ['accent','background']) if(/^#[0-9a-f]{6}$/i.test(appearance[field]||''))result[field]=appearance[field];
+  // Public templates carry appearance only. Never inherit another author's credentials or endpoint.
+  return {mode:'basic',appearance:result};
+}
+
 function workshopConfig(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input) || JSON.stringify(input).length > 32000) throw Object.assign(new Error('作品配置无效或过大。'), { status: 400 });
   const result = {};
@@ -161,6 +169,7 @@ function workshopConfig(input) {
   const shortcuts = input.customShortcuts || [];
   if (!Array.isArray(shortcuts) || shortcuts.length > 20) throw Object.assign(new Error('快捷入口最多 20 项。'), { status: 400 });
   result.customShortcuts = shortcuts.map(sharedShortcut);
+  result.chat = sharedChat(input.chat);
   if (/^animal-\d{1,12}$/.test(input.animationPreset || '')) result.animationPreset = input.animationPreset;
   if (typeof input.assetAttribution === 'string') result.assetAttribution = input.assetAttribution.slice(0,8000);
   return { ...result, image: 'pet.png', safeRendering: false, targetFps: 120 };
@@ -168,7 +177,7 @@ function workshopConfig(input) {
 
 function publicWorkshop(post, full = false) {
   return { id: post._id, authorId: post.userId, author: post.author, title: post.title, description: post.description || '', preview: post.preview, category: post.category || 'community', animated: post.animated === true, curated: post.curated === true, shortcutCount: post.config?.customShortcuts?.length || post.shortcutCount || 0, style: post.style || 'original', downloads: Number(post.downloads || 0), createdAt: post.createdAt,
-    ...(full ? { image: post.image, imageSha256: post.imageSha256, config: { ...post.config, customShortcuts: (post.config?.customShortcuts || []).flatMap((item) => { try { return [sharedShortcut(item)]; } catch (_) { return []; } }) } } : {}) };
+    ...(full ? { image: post.image, imageSha256: post.imageSha256, config: { ...post.config, chat:sharedChat(post.config?.chat), customShortcuts: (post.config?.customShortcuts || []).flatMap((item) => { try { return [sharedShortcut(item)]; } catch (_) { return []; } }) } } : {}) };
 }
 const plusDays = (oldExpiry, days) => {
   const base = oldExpiry && new Date(oldExpiry) > new Date() ? new Date(oldExpiry) : new Date();
