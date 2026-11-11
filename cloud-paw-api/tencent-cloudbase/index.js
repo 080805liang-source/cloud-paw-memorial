@@ -70,7 +70,8 @@ async function limitRequests(scope, actor, limit, milliseconds) {
 }
 const isAdmin = (user) => ADMIN_EMAILS.has(String(user?.email || '').trim().toLowerCase());
 const hasMembership = (user) => Boolean(user?.vipExpiresAt && new Date(user.vipExpiresAt) > new Date());
-const publicUser = (user) => ({ id: user._id, email: user.email || null, phone: user.phone || null, credits: Number(user.credits || 0), isAdmin: isAdmin(user), membershipActive: hasMembership(user), vipExpiresAt: user.vipExpiresAt || null });
+const identityVerified = (user) => Boolean(user?.emailVerifiedAt || user?.phoneVerifiedAt);
+const publicUser = (user) => ({ id: user._id, email: user.email || null, phone: user.phone || null, identityVerified: identityVerified(user), credits: Number(user.credits || 0), isAdmin: isAdmin(user), membershipActive: hasMembership(user), vipExpiresAt: user.vipExpiresAt || null });
 const readyCollections = new Set();
 async function ensureCollection(name) {
   if (readyCollections.has(name)) return;
@@ -103,7 +104,7 @@ function maskPhone(phone) { return phone ? `${String(phone).slice(0, 3)}****${St
 function adminUserSummary(user) {
   return { id: user._id, identity: user.email ? maskEmail(user.email) : maskPhone(user.phone), createdAt: user.createdAt || null, usageCount: Number(user.usageCount || 0), credits: Number(user.credits || 0), isAdmin: isAdmin(user), vipExpiresAt: user.vipExpiresAt || null, membershipActive: hasMembership(user) };
 }
-async function recordGeneration(user, workshopId = '') {
+async function recordGeneration(user, workshopId = '', freeAi = false) {
   await ensureCollection(ADMIN_EVENTS);
   if (workshopId) await ensureCollection(WORKSHOP);
   return db.runTransaction(async (transaction) => {
@@ -115,8 +116,9 @@ async function recordGeneration(user, workshopId = '') {
     }
     const result = await transaction.collection('cp_users').doc(user._id).get();
     const current = Array.isArray(result.data) ? result.data[0] : result.data;
+    if (freeAi && !identityVerified(current)) throw securityError('请先完成一次邮箱验证，即可使用网站免费 AI。', 403);
     const currentCredits = Number(current?.credits || 0);
-    const unlimited = isAdmin(current) || hasMembership(current);
+    const unlimited = freeAi || isAdmin(current) || hasMembership(current);
     if (!unlimited && currentCredits < 1) throw Object.assign(new Error('请先兑换会员码，再继续使用。'), { status: 403 });
     const credits = unlimited ? currentCredits : currentCredits - 1;
     await transaction.collection('cp_users').doc(user._id).update({ credits, usageCount: db.command.inc(1) });
@@ -232,7 +234,7 @@ async function aiUser(event) {
   return user && (device.authVersion || '') === (user.authVersion || '') && (device.aiVersion || '') === (user.aiVersion || '') ? user : null;
 }
 async function issueAiToken(user) {
-  if (!user.emailVerifiedAt && !user.phoneVerifiedAt) throw securityError('请使用已验证邮箱的账号登录。', 403);
+  if (!identityVerified(user)) throw securityError('请先完成一次邮箱验证，即可使用网站免费 AI。', 403);
   await ensureCollection(AI_TOKENS);
   const token = random(), expiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
   await db.collection(AI_TOKENS).add({ _id: sha256(token), userId: user._id, authVersion: user.authVersion || '', aiVersion: user.aiVersion || '', expiresAt, createdAt: now() });
@@ -380,11 +382,14 @@ exports.main = async (event) => {
     if (!['GET','POST','PUT','DELETE'].includes(method)) return reply(event, { error: '请求方法不受支持。' }, 405);
     const body = readBody(event);
     if (method !== 'GET') await limitRequests('write-ip', clientAddress(event), 1500, 60000);
-    if (method === 'GET' && path === '/ai/status') return reply(event, { enabled: aiConfig().enabled, provider: '豆包 / 火山方舟', quota: await aiQuota(await aiUser(event)), totalPerDay: 200 });
+    if (method === 'GET' && path === '/ai/status') {
+      const caller = await aiUser(event);
+      return reply(event, { enabled: aiConfig().enabled, signedIn: Boolean(caller), verificationRequired: Boolean(caller && !identityVerified(caller)), provider: '豆包 / 火山方舟', quota: await aiQuota(caller), totalPerDay: 200 });
+    }
     if (method === 'POST' && path === '/ai/chat') {
       const caller = await aiUser(event);
       if (!caller) return reply(event, { error: '请先登录或重新绑定免费 AI。' }, 401);
-      if (!caller.emailVerifiedAt && !caller.phoneVerifiedAt) return reply(event, { error: '请使用已验证邮箱的账号。' }, 403);
+      if (!identityVerified(caller)) return reply(event, { error: '请先完成一次邮箱验证，即可使用网站免费 AI。', code: 'EMAIL_VERIFICATION_REQUIRED' }, 403);
       const config = aiConfig();
       if (!config.enabled) return reply(event, { error: '免费 AI 尚未启用，请使用离线陪伴或自己的模型。' }, 503);
       const messages = aiMessages(body);
@@ -512,6 +517,38 @@ exports.main = async (event) => {
     }
     const user = await sessionUser(event);
     if (!user) return reply(event, { error: '请先登录。' }, 401);
+    if (method === 'POST' && path === '/auth/send-verification-code') {
+      if (identityVerified(user)) return reply(event, { error: '账号已验证，可以直接使用免费 AI。' }, 409);
+      const email = user.email || String(body.email || '').trim().toLowerCase();
+      if (!emailPattern.test(email)) return reply(event, { error: '请填写有效邮箱。' }, 400);
+      const existing = await getOne('cp_users', { email });
+      if (existing && existing._id !== user._id) return reply(event, { error: '此邮箱已绑定其他账号，请换一个邮箱。' }, 409);
+      await limitRequests('email-ip', clientAddress(event), 30, 3600000);
+      await limitRequests('email-global', 'all', 200, 3600000);
+      await limitRequests('email-address', email, 5, 3600000);
+      return reply(event, await startEmailVerification(email, `account:${user._id}`));
+    }
+    if (method === 'POST' && path === '/auth/verify-email') {
+      if (identityVerified(user)) return reply(event, { user: publicUser(user) });
+      const email = user.email || String(body.email || '').trim().toLowerCase();
+      if (!emailPattern.test(email)) return reply(event, { error: '请填写有效邮箱。' }, 400);
+      const verification = await verifyEmailCode(email, String(body.emailCode || '').trim(), String(body.challengeId || ''), `account:${user._id}`);
+      const updated = await db.runTransaction(async transaction => {
+        const result = await transaction.collection(EMAIL_CODES).doc(verification._id).get();
+        const current = Array.isArray(result.data) ? result.data[0] : result.data;
+        if (!current || current.purpose !== `account:${user._id}` || current.challengeId !== verification.challengeId || current.usedAt || Date.parse(current.expiresAt) <= Date.now()) throw emailError('邮箱验证码错误或已过期。');
+        const accountResult = await transaction.collection('cp_users').doc(user._id).get();
+        const account = Array.isArray(accountResult.data) ? accountResult.data[0] : accountResult.data;
+        if (!account || (account.authVersion || '') !== (user.authVersion || '') || (account.email || '') !== (user.email || '')) throw securityError('账号已更新，请重新登录。', 401);
+        const existing = await transaction.collection('cp_users').where({ email }).limit(1).get();
+        if (existing.data.some(item => item._id !== user._id)) throw emailError('此邮箱已绑定其他账号，请换一个邮箱。', 409);
+        const change = { email, emailVerifiedAt: now() };
+        await transaction.collection('cp_users').doc(user._id).update(change);
+        await transaction.collection(EMAIL_CODES).doc(verification._id).update({ usedAt: now() });
+        return { ...account, ...change };
+      });
+      return reply(event, { user: publicUser(updated) });
+    }
     if (method === 'POST' && path === '/ai/device-token') {
       await limitRequests('ai-token-user', user._id, 10, 86400000);
       return reply(event, await issueAiToken(user), 201);
@@ -584,9 +621,10 @@ exports.main = async (event) => {
       let credits;
       const workshopId = String(body.workshopId || '');
       if (workshopId && !/^[a-zA-Z0-9_-]{1,80}$/.test(workshopId)) return reply(event, { error: '作品参数无效。' }, 400);
-      try { credits = await recordGeneration(user, workshopId); }
+      const freeAi = body.chatMode === 'free';
+      try { credits = await recordGeneration(user, workshopId, freeAi); }
       catch (error) { if ([403,404].includes(error.status)) return reply(event, { error: error.message }, error.status); throw error; }
-      return reply(event, { credits, unlimited: isAdmin(user) || hasMembership(user) });
+      return reply(event, { credits, freeAi, unlimited: freeAi || isAdmin(user) || hasMembership(user) });
     }
     if (method === 'POST' && path === '/feedback') {
       const category = String(body.category || '');
