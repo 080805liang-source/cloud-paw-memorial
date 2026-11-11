@@ -378,6 +378,12 @@ exports.main = async (event) => {
   if (origin && !isAllowedOrigin(origin)) return reply(event, { error: '来源不被允许。' }, 403);
   try {
     if (path === '/health') return reply(event, { ok: true, region: 'cn', release: 'workshop-20261107' });
+    if (method === 'GET' && path.startsWith('/downloads/runtime/')) {
+      const packet = require('./runtime-download.cjs').download(path);
+      const result = reply(event, packet || {error:'运行文件不存在。'}, packet ? 200 : 404);
+      if (packet) result.headers['cache-control'] = 'public, max-age=31536000, immutable';
+      return result;
+    }
     if (method === 'POST' && ['/orders', '/admin/confirm-order'].includes(path)) return reply(event, { error: '站内支付已关闭，请登录后兑换会员码。' }, 410);
     if (!['GET','POST','PUT','DELETE'].includes(method)) return reply(event, { error: '请求方法不受支持。' }, 405);
     const body = readBody(event);
